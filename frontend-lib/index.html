@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>UpPass Secure Bridge — Demo</title>
+  <style>
+    body { font-family: monospace; max-width: 720px; margin: 40px auto; padding: 0 20px; background: #0d1117; color: #c9d1d9; }
+    h1 { color: #58a6ff; }
+    label { display: block; margin-top: 16px; color: #8b949e; font-size: 13px; }
+    input { width: 100%; padding: 8px; margin-top: 4px; background: #161b22; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; font-family: monospace; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 10px 24px; background: #238636; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #2ea043; }
+    button:disabled { background: #30363d; cursor: not-allowed; }
+    pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-right: 6px; }
+    .ok   { background: #1f6130; color: #3fb950; }
+    .err  { background: #5c2121; color: #f85149; }
+    .info { background: #1c2d42; color: #58a6ff; }
+    hr { border-color: #30363d; }
+    section { margin-top: 32px; }
+  </style>
+</head>
+<body>
+  <h1>UpPass Secure Bridge</h1>
+  <p>End-to-end encryption demo — hybrid RSA-OAEP + AES-256-GCM</p>
+  <hr />
+
+  <section>
+    <h2>Submit National ID</h2>
+    <label>National ID</label>
+    <input id="nationalId" type="text" value="1234567890123" maxlength="13" />
+    <button id="btnSubmit" onclick="submitId()">Encrypt &amp; Submit</button>
+    <label style="margin-top:20px">Result</label>
+    <pre id="submitOut">—</pre>
+  </section>
+
+  <section>
+    <h2>Search by National ID</h2>
+    <label>National ID to search</label>
+    <input id="searchId" type="text" value="1234567890123" maxlength="13" />
+    <button onclick="searchId()">Search</button>
+    <label style="margin-top:20px">Result</label>
+    <pre id="searchOut">—</pre>
+  </section>
+
+  <script src="/config.js"></script>
+  <script type="module">
+    import { UpPassSecureBridge } from "./dist/uppass-secure-bridge.js";
+
+    const API = window.UPPASS_API_URL || "http://localhost:8000";
+
+    // Fetch the public key from the backend — no hardcoded PEM, supports key rotation
+    const { key_version, public_key } = await fetch(`${API}/v1/public-key`).then(r => r.json());
+    const bridge = new UpPassSecureBridge({ publicKeyPem: public_key, keyVersion: key_version });
+    await bridge.init();
+
+    window.submitId = async function () {
+      const out = document.getElementById("submitOut");
+      const btn = document.getElementById("btnSubmit");
+      const nationalId = document.getElementById("nationalId").value.trim();
+      btn.disabled = true;
+      out.textContent = "Encrypting…";
+      try {
+        const payload = await bridge.encrypt(nationalId);
+        out.textContent = "Sending to backend…";
+        const res = await fetch(`${API}/v1/submit`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        const tag = res.ok ? '<span class="tag ok">201 OK</span>' : '<span class="tag err">Error</span>';
+        out.innerHTML = tag + "\n" + JSON.stringify(data, null, 2);
+        document.getElementById("searchId").value = nationalId;
+      } catch (e) {
+        out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    window.searchId = async function () {
+      const out = document.getElementById("searchOut");
+      const nationalId = document.getElementById("searchId").value.trim();
+      out.textContent = "Searching…";
+      try {
+        const res = await fetch(`${API}/v1/search?national_id=${encodeURIComponent(nationalId)}`);
+        const data = await res.json();
+        const tag = data.found ? '<span class="tag ok">Found</span>' : '<span class="tag info">Not found</span>';
+        out.innerHTML = tag + "\n" + JSON.stringify(data, null, 2);
+      } catch (e) {
+        out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
+      }
+    };
+  </script>
+</body>
+</html>

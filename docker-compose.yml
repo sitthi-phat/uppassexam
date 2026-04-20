@@ -1,0 +1,49 @@
+version: "3.9"
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: uppass
+      MYSQL_USER: uppass
+      MYSQL_PASSWORD: uppasspassword
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "uppass", "-puppasspassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: ./backend
+    ports:
+      - "8000:8080"
+    environment:
+      - ENV=development
+      - DATABASE_URL=mysql+pymysql://uppass:uppasspassword@mysql:3306/uppass
+      - PRIVATE_KEY_PATH=/app/keys/private_v1.pem
+      - HMAC_SECRET=${HMAC_SECRET}
+      - DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY}
+      - ALLOWED_ORIGINS=http://localhost:3000
+    volumes:
+      - ./backend/keys:/app/keys:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend-lib
+    ports:
+      - "3000:8080"
+    environment:
+      - UPPASS_API_URL=http://localhost:8000
+    depends_on:
+      - api
+
+volumes:
+  mysql_data:

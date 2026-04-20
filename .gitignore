@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+backend/keys/
+*.pem
+
+# Database
+backend/uppass.db
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Node
+frontend-lib/node_modules/
+frontend-lib/dist/
+
+# OS
+.DS_Store
+Thumbs.db

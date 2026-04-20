@@ -1,0 +1,17 @@
+{
+  "name": "@uppass/secure-bridge",
+  "version": "1.0.0",
+  "description": "UpPass client-side E2E encryption library",
+  "main": "dist/uppass-secure-bridge.js",
+  "types": "dist/uppass-secure-bridge.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "example": "ts-node src/example.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "ts-node": "^10.9.0",
+    "@types/node": "^22.0.0"
+  }
+}
