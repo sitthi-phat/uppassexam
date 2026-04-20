@@ -91,10 +91,19 @@ _private_keys: dict[str, object] = {}   # version → CryptoKey
 
 def load_private_keys() -> None:
     """
-    Load private keys by version at startup.
-    In production: fetch from AWS Secrets Manager / HashiCorp Vault.
-    Key files: keys/private_v1.pem, keys/private_v2.pem, ...
+    Load private keys at startup. Priority:
+    1. PRIVATE_KEY_B64 env var (base64 PEM) — used in Cloud Run via Secret Manager env var
+    2. PRIVATE_KEY_PATH file — used locally / docker-compose
     """
+    # Cloud Run: key injected as base64 env var from Secret Manager
+    key_b64 = os.environ.get("PRIVATE_KEY_B64", "")
+    if key_b64:
+        pem = base64.b64decode(key_b64)
+        _private_keys["v1"] = serialization.load_pem_private_key(pem, password=None)
+        log.info("Loaded private key version=v1 (env var)")
+        return
+
+    # Local / Docker: scan key directory for versioned PEM files
     key_dir = os.path.dirname(PRIVATE_KEY_PATH)
     loaded = 0
     for fname in os.listdir(key_dir) if os.path.isdir(key_dir) else []:
@@ -106,11 +115,13 @@ def load_private_keys() -> None:
             log.info("Loaded private key version=%s", version)
             loaded += 1
 
-    # Fallback: load single key as v1
     if loaded == 0 and os.path.exists(PRIVATE_KEY_PATH):
         with open(PRIVATE_KEY_PATH, "rb") as f:
             _private_keys["v1"] = serialization.load_pem_private_key(f.read(), password=None)
-        log.info("Loaded private key version=v1 (default path)")
+        log.info("Loaded private key version=v1 (file path)")
+
+    if not _private_keys:
+        raise RuntimeError("No private key loaded — set PRIVATE_KEY_B64 or PRIVATE_KEY_PATH")
 
 
 def get_private_key(version: str = "v1"):
@@ -189,7 +200,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
     # Disable automatic request body logging in OpenAPI playground
-    docs_url="/docs" if os.environ.get("ENV") != "production" else None,
+    docs_url="/docs" if os.environ.get("ENABLE_DOCS", "true").lower() == "true" else None,
     redoc_url=None,
 )
 
