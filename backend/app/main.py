@@ -33,7 +33,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, String, DateTime, text
+from sqlalchemy import create_engine, Column, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -66,13 +66,13 @@ Base = declarative_base()
 class NationalIdRecord(Base):
     __tablename__ = "national_ids"
 
-    id           = Column(String, primary_key=True, default=lambda: secrets.token_hex(16))
+    id           = Column(String(32),  primary_key=True, default=lambda: secrets.token_hex(16))
     # Column A: Randomised encryption (AES-GCM, unique IV per record)
-    encrypted_data = Column(String, nullable=False)
-    storage_iv     = Column(String, nullable=False)   # IV used for Column A
+    encrypted_data = Column(Text,       nullable=False)
+    storage_iv     = Column(String(24), nullable=False)   # base64(12-byte IV) = 16 chars
     # Column B: Deterministic HMAC-SHA256 blind index for exact-match search
-    search_index   = Column(String, nullable=False, index=True)
-    key_version    = Column(String, nullable=False, default="v1")
+    search_index   = Column(String(64), nullable=False, index=True)  # SHA-256 hex = 64 chars
+    key_version    = Column(String(10), nullable=False, default="v1")
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
