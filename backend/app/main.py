@@ -16,8 +16,8 @@ Security design:
   - Plaintext National IDs never written to logs (middleware enforced)
   - Blind index (HMAC-SHA256) enables exact-match search without decrypting
   - Randomised encryption (AES-GCM with random IV) for storage column
-  - HMAC versioning: search queries all known HMAC versions so records remain
-    findable during a chunked migration window
+  - HMAC versioning: all known HMAC versions loaded from Secret Manager at startup;
+    search tries every version so records remain findable across restarts and during migration
 """
 
 import os
@@ -66,7 +66,7 @@ class _State:
         self.current_rsa_version: str  = "v1"
         self.dek_keys: dict            = {}    # version → 32-byte AES key (bytes)
         self.current_dek_version: str  = "v1"
-        self.hmac_secret: bytes        = b""   # single current secret, same pattern as DEK/RSA
+        self.hmac_secrets: dict        = {}    # version → bytes (same pattern as dek_keys/private_keys)
         self.current_hmac_version: str = "v1"
 
 state = _State()
@@ -98,6 +98,18 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _db_distinct_versions(column: str) -> set:
+    """Return the set of distinct version labels stored in national_ids for a given column."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(f"SELECT DISTINCT {column} FROM national_ids WHERE {column} IS NOT NULL")
+            ).fetchall()
+        return {row[0] for row in rows if row[0]}
+    except Exception:
+        return set()
 
 
 def _ensure_columns():
@@ -138,6 +150,14 @@ def _sm_project() -> str:
     return project
 
 
+def _load_secret_version(secret_id: str, version: int) -> str:
+    """Fetch a specific numbered version of a Secret Manager secret."""
+    client = _secret_manager_client()
+    name   = f"projects/{_sm_project()}/secrets/{secret_id}/versions/{version}"
+    resp   = client.access_secret_version(request={"name": name})
+    return resp.payload.data.decode("utf-8")
+
+
 def _store_secret_version(secret_id: str, data: bytes) -> str:
     """Add a new version to an existing Secret Manager secret. Returns version name."""
     client  = _secret_manager_client()
@@ -154,97 +174,123 @@ def _store_secret_version(secret_id: str, data: bytes) -> str:
 
 def load_private_keys() -> None:
     """
-    Load RSA private keys at startup.
-    Priority:
-      1. PRIVATE_KEY_B64 env var (base64 PEM) — Cloud Run via Secret Manager env var
-      2. PRIVATE_KEY_PATH file directory — local / docker-compose
+    Load ALL RSA private key versions referenced in the DB from Secret Manager.
+    Falls back to PRIVATE_KEY_B64 env var or key files for v1 (local dev).
+
+    Versions in DB (key_version column) map 1-to-1 with Secret Manager version
+    numbers on the 'uppass-private-key-v1-b64' secret:
+      DB "v1" → SM version 1
+      DB "v2" → SM version 2  (after rotate-rsa)
+      etc.
     """
-    key_b64 = os.environ.get("PRIVATE_KEY_B64", "")
-    if key_b64:
-        pem = base64.b64decode(key_b64)
-        state.private_keys["v1"] = serialization.load_pem_private_key(pem, password=None)
-        state.current_rsa_version = "v1"
-        log.info("Loaded private key version=v1 (env var)")
-        return
+    versions_needed = _db_distinct_versions("key_version")
+    versions_needed.add("v1")  # always need v1 for new installs with empty DB
 
-    key_dir = os.path.dirname(PRIVATE_KEY_PATH)
-    loaded  = 0
-    for fname in os.listdir(key_dir) if os.path.isdir(key_dir) else []:
-        if fname.startswith("private_") and fname.endswith(".pem"):
-            version = fname.replace("private_", "").replace(".pem", "")
-            path    = os.path.join(key_dir, fname)
-            with open(path, "rb") as f:
-                state.private_keys[version] = serialization.load_pem_private_key(f.read(), password=None)
-            log.info("Loaded private key version=%s", version)
-            loaded += 1
+    for ver in sorted(versions_needed, key=lambda v: int(v[1:])):
+        ver_num = int(ver[1:])
 
-    if loaded == 0 and os.path.exists(PRIVATE_KEY_PATH):
-        with open(PRIVATE_KEY_PATH, "rb") as f:
-            state.private_keys["v1"] = serialization.load_pem_private_key(f.read(), password=None)
-        state.current_rsa_version = "v1"
-        log.info("Loaded private key version=v1 (file path)")
+        # Try Secret Manager first (authoritative in production)
+        try:
+            raw_b64 = _load_secret_version("uppass-private-key-v1-b64", ver_num)
+            pem = base64.b64decode(raw_b64)
+            state.private_keys[ver] = serialization.load_pem_private_key(pem, password=None)
+            log.info("Loaded RSA key version=%s from Secret Manager", ver)
+            continue
+        except Exception:
+            pass
 
-    if state.private_keys:
-        state.current_rsa_version = sorted(state.private_keys.keys())[-1]
+        # v1 fallback: env var (Cloud Run initial deploy) or key files (local dev)
+        if ver == "v1":
+            key_b64 = os.environ.get("PRIVATE_KEY_B64", "")
+            if key_b64:
+                pem = base64.b64decode(key_b64)
+                state.private_keys["v1"] = serialization.load_pem_private_key(pem, password=None)
+                log.info("Loaded RSA key version=v1 from env var")
+                continue
+
+            key_dir = os.path.dirname(PRIVATE_KEY_PATH)
+            if os.path.isdir(key_dir):
+                for fname in os.listdir(key_dir):
+                    if fname.startswith("private_") and fname.endswith(".pem"):
+                        fver = fname.replace("private_", "").replace(".pem", "")
+                        with open(os.path.join(key_dir, fname), "rb") as f:
+                            state.private_keys[fver] = serialization.load_pem_private_key(f.read(), password=None)
+                        log.info("Loaded RSA key version=%s from file", fver)
+            elif os.path.exists(PRIVATE_KEY_PATH):
+                with open(PRIVATE_KEY_PATH, "rb") as f:
+                    state.private_keys["v1"] = serialization.load_pem_private_key(f.read(), password=None)
+                log.info("Loaded RSA key version=v1 from file path")
 
     if not state.private_keys:
         raise RuntimeError("No private key loaded — set PRIVATE_KEY_B64 or PRIVATE_KEY_PATH")
 
+    state.current_rsa_version = max(state.private_keys.keys(), key=lambda v: int(v[1:]))
+
 
 def init_dek() -> None:
     """
-    Load DEK from DATA_ENCRYPTION_KEY env var.
-    The env var always contains the latest DEK (Secret Manager :latest).
-    We detect which version label the DB records are using so the key
-    loads under the right label after a Cloud Run restart.
+    Load ALL DEK versions referenced in the DB from Secret Manager.
+    DB column 'dek_version' label "vN" maps to SM version number N.
+    Falls back to DATA_ENCRYPTION_KEY env var for v1 (local dev / initial deploy).
     """
-    raw = os.environ.get("DATA_ENCRYPTION_KEY", "")
-    if not raw:
+    versions_needed = _db_distinct_versions("dek_version")
+    versions_needed.add("v1")
+
+    for ver in sorted(versions_needed, key=lambda v: int(v[1:])):
+        ver_num = int(ver[1:])
+
+        try:
+            raw = _load_secret_version("uppass-dek", ver_num)
+            state.dek_keys[ver] = hashlib.sha256(raw.encode()).digest()
+            log.info("Loaded DEK version=%s from Secret Manager", ver)
+            continue
+        except Exception:
+            pass
+
+        if ver == "v1":
+            raw = os.environ.get("DATA_ENCRYPTION_KEY", "")
+            if raw:
+                state.dek_keys["v1"] = hashlib.sha256(raw.encode()).digest()
+                log.info("Loaded DEK version=v1 from env var")
+
+    if not state.dek_keys:
         raise RuntimeError("DATA_ENCRYPTION_KEY env var is required")
-    derived = hashlib.sha256(raw.encode()).digest()
 
-    # After a full DEK rotation all records share the same dek_version.
-    # Read one row to discover the current label (falls back to "v1").
-    current_ver = "v1"
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT dek_version FROM national_ids WHERE dek_version IS NOT NULL LIMIT 1")
-            ).fetchone()
-            if row and row[0]:
-                current_ver = row[0]
-    except Exception:
-        pass
-
-    state.dek_keys[current_ver] = derived
-    state.current_dek_version   = current_ver
-    log.info("Loaded DEK version=%s", current_ver)
+    state.current_dek_version = max(state.dek_keys.keys(), key=lambda v: int(v[1:]))
+    log.info("DEK ready: versions=%s current=%s", sorted(state.dek_keys), state.current_dek_version)
 
 
 def init_hmac() -> None:
     """
-    Load HMAC_SECRET env var — same pattern as init_dek / load_private_keys.
-    Detects the current hmac_version label from DB so the label survives restarts.
-    All instances load the same secret from the same env var, so state is consistent.
+    Load ALL HMAC secret versions referenced in the DB from Secret Manager.
+    DB column 'hmac_version' label "vN" maps to SM version number N.
+    Falls back to HMAC_SECRET env var for v1 (local dev / initial deploy).
     """
-    raw = os.environ.get("HMAC_SECRET", "")
-    if not raw:
+    versions_needed = _db_distinct_versions("hmac_version")
+    versions_needed.add("v1")
+
+    for ver in sorted(versions_needed, key=lambda v: int(v[1:])):
+        ver_num = int(ver[1:])
+
+        try:
+            raw = _load_secret_version("uppass-hmac-secret", ver_num)
+            state.hmac_secrets[ver] = raw.encode()
+            log.info("Loaded HMAC secret version=%s from Secret Manager", ver)
+            continue
+        except Exception:
+            pass
+
+        if ver == "v1":
+            raw = os.environ.get("HMAC_SECRET", "")
+            if raw:
+                state.hmac_secrets["v1"] = raw.encode()
+                log.info("Loaded HMAC secret version=v1 from env var")
+
+    if not state.hmac_secrets:
         raise RuntimeError("HMAC_SECRET env var is required")
 
-    current_ver = "v1"
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT hmac_version FROM national_ids WHERE hmac_version IS NOT NULL LIMIT 1")
-            ).fetchone()
-            if row and row[0]:
-                current_ver = row[0]
-    except Exception:
-        pass
-
-    state.hmac_secret          = raw.encode()
-    state.current_hmac_version = current_ver
-    log.info("Loaded HMAC secret version=%s", current_ver)
+    state.current_hmac_version = max(state.hmac_secrets.keys(), key=lambda v: int(v[1:]))
+    log.info("HMAC ready: versions=%s current=%s", sorted(state.hmac_secrets), state.current_hmac_version)
 
 
 def get_private_key(version: str = "v1"):
@@ -284,8 +330,12 @@ def aes_gcm_encrypt(plaintext: str, aes_key: bytes) -> tuple[str, str]:
     return base64.b64encode(ciphertext).decode(), base64.b64encode(iv).decode()
 
 
-def compute_blind_index(national_id: str) -> str:
-    return hmac_mod.new(state.hmac_secret, national_id.encode("utf-8"), hashlib.sha256).hexdigest()
+def compute_blind_index(national_id: str, hmac_ver: str = None) -> str:
+    ver    = hmac_ver or state.current_hmac_version
+    secret = state.hmac_secrets.get(ver)
+    if not secret:
+        raise HTTPException(status_code=500, detail=f"Unknown HMAC version: {ver}")
+    return hmac_mod.new(secret, national_id.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def get_storage_key(dek_ver: str = "v1") -> bytes:
@@ -444,19 +494,21 @@ def submit(body: SubmitRequest, db: Session = Depends(get_db)):
 
 @app.get("/v1/search", response_model=SearchResponse)
 def search(national_id: str, db: Session = Depends(get_db)):
-    blind_index = compute_blind_index(national_id)
-    record = (
-        db.query(NationalIdRecord)
-        .filter(NationalIdRecord.search_index == blind_index)
-        .first()
-    )
-    if not record:
-        return SearchResponse(found=False, ref=None, created_at=None)
-    return SearchResponse(
-        found=True,
-        ref=record.id,
-        created_at=record.created_at.isoformat() if record.created_at else None,
-    )
+    # Try every loaded HMAC version — records remain findable during migration window
+    for ver in sorted(state.hmac_secrets.keys(), key=lambda v: int(v[1:]), reverse=True):
+        blind_index = compute_blind_index(national_id, ver)
+        record = (
+            db.query(NationalIdRecord)
+            .filter(NationalIdRecord.search_index == blind_index)
+            .first()
+        )
+        if record:
+            return SearchResponse(
+                found=True,
+                ref=record.id,
+                created_at=record.created_at.isoformat() if record.created_at else None,
+            )
+    return SearchResponse(found=False, ref=None, created_at=None)
 
 
 # ─── Admin endpoints (demo key rotation) ─────────────────────────────────────
@@ -591,10 +643,10 @@ def rotate_hmac(body: RotateHMACRequest = RotateHMACRequest(), db: Session = Dep
     """
     Chunked HMAC rotation — same pattern as DEK/RSA rotation.
 
-    Single secret in state (state.hmac_secret), consistent across all instances
-    because every instance loads the same HMAC_SECRET env var at startup.
+    All HMAC versions are loaded from Secret Manager at startup so every instance
+    has a consistent view of all secrets across restarts.
 
-    First call: generates a new secret, hot-reloads state.hmac_secret, stores to
+    First call: generates a new secret, adds to state.hmac_secrets, stores to
     Secret Manager, then migrates up to chunk_size records.
 
     Subsequent calls: continues migrating remaining records.
@@ -624,9 +676,9 @@ def rotate_hmac(body: RotateHMACRequest = RotateHMACRequest(), db: Session = Dep
         except Exception as exc:
             log.warning("Secret Manager store skipped (%s) — demo mode", type(exc).__name__)
 
-        # Hot-reload — single secret, same pattern as DEK/RSA
-        state.hmac_secret          = new_secret
-        state.current_hmac_version = new_ver
+        # Hot-reload — add to dict, same pattern as dek_keys / private_keys
+        state.hmac_secrets[new_ver] = new_secret
+        state.current_hmac_version  = new_ver
         log.info("HMAC rotated to version=%s (secret_stored=%s)", new_ver, secret_stored)
     else:
         new_ver = state.current_hmac_version
@@ -649,7 +701,7 @@ def rotate_hmac(body: RotateHMACRequest = RotateHMACRequest(), db: Session = Dep
             continue
         try:
             plaintext        = aes_gcm_decrypt(rec.encrypted_data, rec.storage_iv, dek_key)
-            rec.search_index = hmac_mod.new(state.hmac_secret, plaintext.encode("utf-8"), hashlib.sha256).hexdigest()
+            rec.search_index = compute_blind_index(plaintext, new_ver)
             rec.hmac_version = new_ver
             recomputed += 1
         except Exception as exc:
@@ -773,10 +825,9 @@ def reset_demo(db: Session = Depends(get_db)):
         if first is not None:
             d["v1"] = first
 
-    _keep_first(state.dek_keys);    state.current_dek_version  = "v1"
-    _keep_first(state.private_keys); state.current_rsa_version = "v1"
-    # hmac_secret is a single bytes value, not a dict — just reset the version label
-    state.current_hmac_version = "v1"
+    _keep_first(state.dek_keys);     state.current_dek_version  = "v1"
+    _keep_first(state.private_keys); state.current_rsa_version  = "v1"
+    _keep_first(state.hmac_secrets); state.current_hmac_version = "v1"
 
     log.info("Demo reset: deleted %d records, all key states reset to v1", deleted)
     return {"deleted_records": deleted, "message": "Demo reset complete. All records deleted, key versions reset to v1."}
