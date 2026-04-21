@@ -1,0 +1,9 @@
+.gcloudignore
+.git
+.gitignore
+frontend-lib/node_modules/
+frontend-lib/dist/
+backend/keys/
+*.pem
+*.db
+.env

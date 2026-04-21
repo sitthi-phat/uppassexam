@@ -1,0 +1,6 @@
+# TruffleHog filesystem exclusion list
+# Each line is a regex matched against the full file path.
+# Exclude generated and vendor directories that are not developer-written code.
+frontend-lib/node_modules/
+frontend-lib/dist/
+\.git/

@@ -1,0 +1,46 @@
+steps:
+  # ── Step 1: TruffleHog secret scan ──────────────────────────────────────────
+  # Scans /workspace for hardcoded API keys, tokens, passwords, and secrets.
+  # --fail    : exits non-zero (fails the build) if any findings are detected
+  # --no-update: skips version check (required in sandboxed build environments)
+  - id: secret-scan
+    name: trufflesecurity/trufflehog:latest
+    args:
+      - filesystem
+      - /workspace
+      - --fail
+      - --no-update
+      - --exclude-paths=/workspace/.trufflehog-exclude
+
+  # ── Step 2a: Build backend image ────────────────────────────────────────────
+  - id: build-backend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/backend:latest
+      - -t
+      - asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/backend:$BUILD_ID
+      - ./backend
+    waitFor: [secret-scan]
+
+  # ── Step 2b: Build frontend image (parallel with backend) ───────────────────
+  - id: build-frontend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/frontend:latest
+      - -t
+      - asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/frontend:$BUILD_ID
+      - ./frontend-lib
+    waitFor: [secret-scan]
+
+images:
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/backend:latest
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/backend:$BUILD_ID
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/frontend:latest
+  - asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/frontend:$BUILD_ID
+
+options:
+  logging: CLOUD_LOGGING_ONLY

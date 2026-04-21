@@ -4,20 +4,42 @@
   <meta charset="UTF-8" />
   <title>UpPass Secure Bridge — Demo</title>
   <style>
-    body { font-family: monospace; max-width: 720px; margin: 40px auto; padding: 0 20px; background: #0d1117; color: #c9d1d9; }
+    body { font-family: monospace; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #0d1117; color: #c9d1d9; }
     h1 { color: #58a6ff; }
+    h2 { color: #e6edf3; margin-bottom: 8px; }
+    h3 { color: #8b949e; font-size: 13px; margin: 0 0 12px 0; font-weight: normal; }
     label { display: block; margin-top: 16px; color: #8b949e; font-size: 13px; }
     input { width: 100%; padding: 8px; margin-top: 4px; background: #161b22; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; font-family: monospace; box-sizing: border-box; }
-    button { margin-top: 16px; padding: 10px 24px; background: #238636; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    button { margin-top: 12px; padding: 10px 24px; background: #238636; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
     button:hover { background: #2ea043; }
     button:disabled { background: #30363d; cursor: not-allowed; }
-    pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+    button.danger { background: #b62324; }
+    button.danger:hover { background: #d73a4a; }
+    button.warn { background: #9a6700; }
+    button.warn:hover { background: #bf8700; }
+    pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; margin-top: 12px; }
     .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-right: 6px; }
     .ok   { background: #1f6130; color: #3fb950; }
     .err  { background: #5c2121; color: #f85149; }
     .info { background: #1c2d42; color: #58a6ff; }
+    .warn-tag { background: #3d2e00; color: #e3b341; }
     hr { border-color: #30363d; }
     section { margin-top: 32px; }
+    .admin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 16px; }
+    .admin-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; }
+    .admin-card.rsa-card  { border-color: #d73a4a55; }
+    .admin-card.dek-card  { border-color: #e3b34155; }
+    .admin-card.hmac-card { border-color: #58a6ff55; }
+    .card-title { font-size: 14px; font-weight: bold; margin-bottom: 4px; }
+    .card-title.rsa  { color: #f85149; }
+    .card-title.dek  { color: #e3b341; }
+    .card-title.hmac { color: #58a6ff; }
+    .card-desc { font-size: 11px; color: #8b949e; margin-bottom: 12px; line-height: 1.5; }
+    .status-bar { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; font-size: 12px; display: flex; gap: 24px; flex-wrap: wrap; margin-top: 12px; }
+    .status-item { display: flex; flex-direction: column; gap: 2px; }
+    .status-label { color: #8b949e; font-size: 10px; text-transform: uppercase; }
+    .status-value { color: #3fb950; font-weight: bold; }
+    .simulate-note { font-size: 11px; color: #e3b341; background: #3d2e0066; border: 1px solid #e3b34133; border-radius: 4px; padding: 8px 12px; margin-bottom: 12px; }
   </style>
 </head>
 <body>
@@ -25,6 +47,7 @@
   <p>End-to-end encryption demo — hybrid RSA-OAEP + AES-256-GCM</p>
   <hr />
 
+  <!-- ── Submit ── -->
   <section>
     <h2>Submit National ID</h2>
     <label>National ID</label>
@@ -34,6 +57,7 @@
     <pre id="submitOut">—</pre>
   </section>
 
+  <!-- ── Search ── -->
   <section>
     <h2>Search by National ID</h2>
     <label>National ID to search</label>
@@ -43,17 +67,95 @@
     <pre id="searchOut">—</pre>
   </section>
 
+  <!-- ── Admin: Key Rotation ── -->
+  <section id="adminSection">
+    <h2>Admin — Key Rotation Simulator</h2>
+    <h3>Simulate key rotation events. Each action generates a new key, hot-reloads the server, and migrates existing records in-place.</h3>
+
+    <div class="simulate-note">
+      ⚠ Demo mode: Secret Manager writes are best-effort. In production, run these operations with proper IAM controls and audit logging.
+    </div>
+
+    <!-- Status bar -->
+    <div class="status-bar" id="statusBar">
+      <div class="status-item"><span class="status-label">RSA Version</span><span class="status-value" id="statusRSA">—</span></div>
+      <div class="status-item"><span class="status-label">DEK Version</span><span class="status-value" id="statusDEK">—</span></div>
+      <div class="status-item"><span class="status-label">Total Records</span><span class="status-value" id="statusRecords">—</span></div>
+    </div>
+
+    <div class="admin-grid">
+
+      <!-- RSA Card -->
+      <div class="admin-card rsa-card">
+        <div class="card-title rsa">RSA Key Rotation</div>
+        <div class="card-desc">
+          Use when: private key is compromised or stolen.<br>
+          Generates RSA-2048, stores to Secret Manager, hot-reloads.
+          Old keys remain for decrypting in-flight data.
+        </div>
+        <button class="danger" onclick="rotateRSA()" id="btnRSA">Generate &amp; Rotate RSA Key</button>
+        <pre id="rsaOut">—</pre>
+      </div>
+
+      <!-- DEK Card -->
+      <div class="admin-card dek-card">
+        <div class="card-title dek">DEK Rotation</div>
+        <div class="card-desc">
+          Use when: compliance policy requires periodic re-encryption.<br>
+          Generates 256-bit DEK, re-encrypts all stored records with new key.
+        </div>
+        <button class="warn" onclick="rotateDEK()" id="btnDEK">Generate &amp; Rotate DEK</button>
+        <pre id="dekOut">—</pre>
+      </div>
+
+      <!-- HMAC Card -->
+      <div class="admin-card hmac-card">
+        <div class="card-title hmac">HMAC Secret Rotation</div>
+        <div class="card-desc">
+          Use when: HMAC secret is exposed or compliance requires rotation.<br>
+          Decrypts each record, recomputes blind index in chunks. Search works
+          across all HMAC versions during the migration window.
+        </div>
+        <label style="color:#8b949e;font-size:12px;margin-top:8px">Chunk size (records per call)</label>
+        <input id="hmacChunkSize" type="number" value="100" min="1" max="50000"
+               style="width:120px;margin-top:4px" />
+        <button onclick="rotateHMAC()" id="btnHMAC">Generate &amp; Rotate HMAC</button>
+        <pre id="hmacOut">—</pre>
+      </div>
+
+    </div>
+  </section>
+
   <script src="/config.js"></script>
   <script type="module">
     import { UpPassSecureBridge } from "./dist/uppass-secure-bridge.js";
 
     const API = window.UPPASS_API_URL || "http://localhost:8000";
+    let bridge = null;
 
-    // Fetch the public key from the backend — no hardcoded PEM, supports key rotation
-    const { key_version, public_key } = await fetch(`${API}/v1/public-key`).then(r => r.json());
-    const bridge = new UpPassSecureBridge({ publicKeyPem: public_key, keyVersion: key_version });
-    await bridge.init();
+    async function initBridge() {
+      const { key_version, public_key } = await fetch(`${API}/v1/public-key`).then(r => r.json());
+      bridge = new UpPassSecureBridge({ publicKeyPem: public_key, keyVersion: key_version });
+      await bridge.init();
+      return key_version;
+    }
 
+    async function refreshStatus() {
+      try {
+        const s = await fetch(`${API}/v1/admin/status`).then(r => r.json());
+        document.getElementById("statusRSA").textContent     = s.rsa_version;
+        document.getElementById("statusDEK").textContent     = s.dek_version;
+        document.getElementById("statusRecords").textContent = s.total_records;
+      } catch (e) {
+        // status bar update is non-critical
+      }
+    }
+
+    // Initialise
+    await initBridge();
+    await refreshStatus();
+
+    // ── Submit ──────────────────────────────────────────────────────────────
     window.submitId = async function () {
       const out = document.getElementById("submitOut");
       const btn = document.getElementById("btnSubmit");
@@ -63,15 +165,16 @@
       try {
         const payload = await bridge.encrypt(nationalId);
         out.textContent = "Sending to backend…";
-        const res = await fetch(`${API}/v1/submit`, {
+        const res  = await fetch(`${API}/v1/submit`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(payload),
         });
         const data = await res.json();
-        const tag = res.ok ? '<span class="tag ok">201 OK</span>' : '<span class="tag err">Error</span>';
+        const tag  = res.ok ? '<span class="tag ok">201 OK</span>' : '<span class="tag err">Error</span>';
         out.innerHTML = tag + "\n" + JSON.stringify(data, null, 2);
         document.getElementById("searchId").value = nationalId;
+        await refreshStatus();
       } catch (e) {
         out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
       } finally {
@@ -79,17 +182,109 @@
       }
     };
 
+    // ── Search ──────────────────────────────────────────────────────────────
     window.searchId = async function () {
       const out = document.getElementById("searchOut");
       const nationalId = document.getElementById("searchId").value.trim();
       out.textContent = "Searching…";
       try {
-        const res = await fetch(`${API}/v1/search?national_id=${encodeURIComponent(nationalId)}`);
+        const res  = await fetch(`${API}/v1/search?national_id=${encodeURIComponent(nationalId)}`);
         const data = await res.json();
-        const tag = data.found ? '<span class="tag ok">Found</span>' : '<span class="tag info">Not found</span>';
+        const tag  = data.found ? '<span class="tag ok">Found</span>' : '<span class="tag info">Not found</span>';
         out.innerHTML = tag + "\n" + JSON.stringify(data, null, 2);
       } catch (e) {
         out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
+      }
+    };
+
+    // ── Rotate RSA ──────────────────────────────────────────────────────────
+    window.rotateRSA = async function () {
+      const out = document.getElementById("rsaOut");
+      const btn = document.getElementById("btnRSA");
+      btn.disabled = true;
+      out.textContent = "Generating new RSA-2048 key pair…";
+      try {
+        const res  = await fetch(`${API}/v1/admin/rotate-rsa`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Rotation failed");
+
+        // Re-initialise bridge with new public key
+        const newVer = await initBridge();
+        out.innerHTML = '<span class="tag ok">Rotated</span>\n' + JSON.stringify({
+          new_version: data.new_version,
+          message: data.message,
+          bridge_reloaded: true,
+          active_key_version: newVer,
+        }, null, 2);
+        await refreshStatus();
+      } catch (e) {
+        out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    // ── Rotate DEK ──────────────────────────────────────────────────────────
+    window.rotateDEK = async function () {
+      const out = document.getElementById("dekOut");
+      const btn = document.getElementById("btnDEK");
+      btn.disabled = true;
+      out.textContent = "Generating new DEK and re-encrypting all records…";
+      try {
+        const res  = await fetch(`${API}/v1/admin/rotate-dek`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Rotation failed");
+        out.innerHTML = '<span class="tag ok">Rotated</span>\n' + JSON.stringify(data, null, 2);
+        await refreshStatus();
+      } catch (e) {
+        out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    // ── Rotate HMAC (chunked) ────────────────────────────────────────────────
+    window.rotateHMAC = async function () {
+      const out       = document.getElementById("hmacOut");
+      const btn       = document.getElementById("btnHMAC");
+      const chunkSize = parseInt(document.getElementById("hmacChunkSize").value) || 100;
+      btn.disabled = true;
+
+      let totalRecomputed = 0;
+      let newVersion      = null;
+      let callCount       = 0;
+
+      try {
+        while (true) {
+          callCount++;
+          out.textContent = `Migrating… (call #${callCount}, recomputed so far: ${totalRecomputed})`;
+
+          const res  = await fetch(`${API}/v1/admin/rotate-hmac`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chunk_size: chunkSize }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Rotation failed");
+
+          newVersion       = data.new_version;
+          totalRecomputed += data.recomputed_records;
+
+          if (data.remaining_records === 0) {
+            out.innerHTML = '<span class="tag ok">Complete</span>\n' + JSON.stringify({
+              new_version: newVersion,
+              total_recomputed: totalRecomputed,
+              calls_needed: callCount,
+              message: data.message,
+            }, null, 2);
+            break;
+          }
+        }
+        await refreshStatus();
+      } catch (e) {
+        out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
+      } finally {
+        btn.disabled = false;
       }
     };
   </script>
