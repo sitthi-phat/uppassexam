@@ -40,6 +40,23 @@
     .status-label { color: #8b949e; font-size: 10px; text-transform: uppercase; }
     .status-value { color: #3fb950; font-weight: bold; }
     .simulate-note { font-size: 11px; color: #e3b341; background: #3d2e0066; border: 1px solid #e3b34133; border-radius: 4px; padding: 8px 12px; margin-bottom: 12px; }
+    .danger-note { font-size: 11px; color: #f85149; background: #5c212166; border: 1px solid #f8514933; border-radius: 4px; padding: 8px 12px; margin-bottom: 12px; }
+    .violation-entry { border-left: 3px solid #f85149; padding: 8px 12px; margin-bottom: 8px; background: #1c1010; border-radius: 0 4px 4px 0; font-size: 12px; }
+    .violation-ts { color: #8b949e; font-size: 11px; margin-bottom: 4px; }
+    .violation-payload { color: #f85149; word-break: break-all; }
+    .gcp-links { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+    .gcp-link { display: inline-block; padding: 6px 14px; border-radius: 6px; font-size: 12px; text-decoration: none; border: 1px solid; }
+    .gcp-link.logs  { color: #79c0ff; border-color: #79c0ff55; background: #1c2d4266; }
+    .gcp-link.logs:hover  { background: #1c2d4299; }
+    .gcp-link.metrics { color: #56d364; border-color: #56d36455; background: #1f613066; }
+    .gcp-link.metrics:hover { background: #1f613099; }
+    .gcp-link.alerts  { color: #e3b341; border-color: #e3b34155; background: #3d2e0066; }
+    .gcp-link.alerts:hover  { background: #3d2e0099; }
+    .monitor-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .alert-badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+    .alert-badge.active { background: #5c2121; color: #f85149; }
+    .alert-badge.clear  { background: #1f6130; color: #3fb950; }
+    .violations-empty { color: #8b949e; font-size: 13px; padding: 16px; text-align: center; }
   </style>
 </head>
 <body>
@@ -123,6 +140,57 @@
         <pre id="hmacOut">—</pre>
       </div>
 
+    </div>
+  </section>
+
+  <!-- ── Security Monitor ── -->
+  <section id="securityMonitor">
+    <h2>Security Monitor — PII Leak Detection</h2>
+    <h3>Simulate a developer accidentally logging a plaintext national ID, then watch GCP detect it in real-time.</h3>
+
+    <div class="danger-note">
+      ⚠ The "Submit Unsafe" button intentionally logs the national ID to Cloud Run stdout — simulating a developer mistake.
+      The violations feed queries Cloud Logging for these events. In production this triggers an alert to josukekung@gmail.com.
+    </div>
+
+    <!-- Alert status + GCP links -->
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+      <div>
+        <span style="font-size:13px;color:#8b949e">Alert Policy: </span>
+        <span class="alert-badge" id="alertBadge">checking…</span>
+      </div>
+      <div class="gcp-links">
+        <a class="gcp-link logs" target="_blank"
+           href="https://console.cloud.google.com/logs/query;query=resource.type%3D%22cloud_run_revision%22%20AND%20resource.labels.service_name%3D%22uppass-api%22%20AND%20textPayload%3D~%22SECURITY_VIOLATION%22;project=gen-lang-client-0453424159">
+          Logs Explorer ↗
+        </a>
+        <a class="gcp-link metrics" target="_blank"
+           href="https://console.cloud.google.com/monitoring/metrics-explorer;duration=PT1H;project=gen-lang-client-0453424159">
+          Metrics Explorer ↗
+        </a>
+        <a class="gcp-link alerts" target="_blank"
+           href="https://console.cloud.google.com/monitoring/alerting;project=gen-lang-client-0453424159">
+          Alert Policies ↗
+        </a>
+      </div>
+    </div>
+
+    <!-- Trigger + violations feed -->
+    <div class="monitor-controls">
+      <button class="danger" onclick="submitUnsafe()" id="btnUnsafe">Submit Unsafe (Leak PII to Logs)</button>
+      <button onclick="refreshViolations()" id="btnRefreshViolations">Refresh Violations</button>
+      <label style="display:flex;align-items:center;gap:6px;color:#8b949e;font-size:13px;margin:0;cursor:pointer">
+        <input type="checkbox" id="autoRefresh" onchange="toggleAutoRefresh()" style="width:auto;margin:0" />
+        Auto-refresh (10 s)
+      </label>
+    </div>
+
+    <label>Submit Unsafe Result</label>
+    <pre id="unsafeOut">—</pre>
+
+    <label style="margin-top:20px">Live Violations Feed <span id="violationCount" style="color:#f85149"></span></label>
+    <div id="violationsFeed" style="min-height:60px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin-top:8px">
+      <div class="violations-empty">No violations yet. Click "Refresh Violations" or submit an unsafe request.</div>
     </div>
   </section>
 
@@ -242,6 +310,88 @@
         btn.disabled = false;
       }
     };
+
+    // ── Submit Unsafe (security demo) ───────────────────────────────────────
+    window.submitUnsafe = async function () {
+      const out = document.getElementById("unsafeOut");
+      const btn = document.getElementById("btnUnsafe");
+      const nationalId = document.getElementById("nationalId").value.trim() || "1234567890123";
+      btn.disabled = true;
+      out.textContent = "Encrypting and submitting via unsafe endpoint…";
+      try {
+        const payload = await bridge.encrypt(nationalId);
+        const res  = await fetch(`${API}/v1/submit-unsafe`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        out.innerHTML = '<span class="tag err">PII Leaked to Logs</span>\n' + JSON.stringify(data, null, 2);
+        updateAlertBadge(true);
+        setTimeout(refreshViolations, 3000);  // give Cloud Logging ~3s to ingest
+      } catch (e) {
+        out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    // ── Violations feed ──────────────────────────────────────────────────────
+    window.refreshViolations = async function () {
+      const feed  = document.getElementById("violationsFeed");
+      const count = document.getElementById("violationCount");
+      try {
+        const res  = await fetch(`${API}/v1/admin/monitor/violations?limit=20`);
+        const data = await res.json();
+
+        count.textContent = data.count > 0 ? `(${data.count} found)` : "";
+        updateAlertBadge(data.count > 0);
+
+        if (!data.violations || data.violations.length === 0) {
+          feed.innerHTML = '<div class="violations-empty">No violations found in the last 20 entries.</div>';
+          return;
+        }
+
+        feed.innerHTML = data.violations.map(v => `
+          <div class="violation-entry">
+            <div class="violation-ts">${v.timestamp || "unknown time"} &nbsp;·&nbsp; severity: ${v.severity || "?"}</div>
+            <div class="violation-payload">${escapeHtml(v.payload || "")}</div>
+          </div>
+        `).join("");
+      } catch (e) {
+        feed.innerHTML = `<div class="violations-empty" style="color:#f85149">Error fetching violations: ${e.message}</div>`;
+      }
+    };
+
+    function updateAlertBadge(hasViolations) {
+      const badge = document.getElementById("alertBadge");
+      if (hasViolations) {
+        badge.className = "alert-badge active";
+        badge.textContent = "VIOLATION DETECTED";
+      } else {
+        badge.className = "alert-badge clear";
+        badge.textContent = "Clear";
+      }
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    }
+
+    let _autoRefreshTimer = null;
+    window.toggleAutoRefresh = function () {
+      const on = document.getElementById("autoRefresh").checked;
+      if (on) {
+        refreshViolations();
+        _autoRefreshTimer = setInterval(refreshViolations, 10000);
+      } else {
+        clearInterval(_autoRefreshTimer);
+        _autoRefreshTimer = null;
+      }
+    };
+
+    // Initial violations load
+    refreshViolations();
 
     // ── Rotate HMAC (chunked) ────────────────────────────────────────────────
     window.rotateHMAC = async function () {

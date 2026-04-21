@@ -1,6 +1,6 @@
 # UpPass Secure Bridge — Technical Assignment
 
-> **Role:** Technical Lead | **Stack:** TypeScript (Frontend) + Python / Node.js (Backend)
+> **Role:** Technical Lead | **Stack:** TypeScript (Frontend) + Python / FastAPI (Backend) + GCP
 
 ---
 
@@ -10,8 +10,8 @@
 2. [Architecture Overview](#architecture-overview)
 3. [Part 1 — TypeScript Encryption Library](#part-1--typescript-encryption-library)
 4. [Part 2 — Python Verification Service](#part-2--python-verification-service)
-5. [Running the Project](#running-the-project)
-6. [Deploying to the Cloud](#deploying-to-the-cloud)
+5. [Running Locally](#running-locally)
+6. [Deploying to GCP](#deploying-to-gcp)
 7. [Scenario A — Key Rotation Strategy](#scenario-a--key-rotation-strategy)
 8. [Scenario B — Data Leak Incident Response](#scenario-b--data-leak-incident-response)
 
@@ -25,17 +25,24 @@ uppass/
 │   ├── src/
 │   │   ├── uppass-secure-bridge.ts   ← Core encryption library
 │   │   └── example.ts                ← Integration example
+│   ├── index.html                    ← Demo UI (submit, search, key rotation, security monitor)
 │   ├── package.json
 │   └── tsconfig.json
 ├── backend/
 │   ├── app/
-│   │   └── main.py                   ← FastAPI service
+│   │   └── main.py                   ← FastAPI service (all endpoints)
 │   ├── scripts/
-│   │   └── generate_keys.py          ← RSA key-pair generator
+│   │   └── generate_keys.py          ← RSA key-pair generator (local dev only)
 │   ├── requirements.txt
-│   └── Dockerfile                    ← Multi-stage, non-root
-├── docker-compose.yml
-└── README.md
+│   └── Dockerfile
+├── deploy/
+│   ├── deploy.sh                     ← Cloud Run deploy helper
+│   └── setup-gcp.sh                  ← One-time GCP resource provisioning
+├── cloudbuild.yaml                   ← Cloud Build pipeline (TruffleHog scan → Docker builds)
+├── .trufflehog-exclude               ← TruffleHog path exclusions
+├── .gcloudignore                     ← Files excluded from gcloud builds submit
+├── docker-compose.yml                ← Local dev (MySQL + API + Frontend)
+└── SETUP.md                          ← Full GCP setup guide
 ```
 
 ---
@@ -57,22 +64,32 @@ uppass/
                              │  HTTPS (TLS in transit)
                              ▼
 ┌─────────────────────────────────────────────────────────┐
-│              UpPass Verification Service                │
+│              UpPass Verification Service (Cloud Run)    │
 │                                                         │
 │  POST /v1/submit                                        │
 │    ├─ RSA-OAEP unwrap(encrypted_key)  → AES key         │
 │    ├─ AES-GCM decrypt(encrypted_data) → plaintext       │
-│    ├─ AES-GCM encrypt(plaintext, DEK) → Column A        │
-│    └─ HMAC-SHA256(plaintext, secret)  → Column B        │
+│    ├─ AES-GCM encrypt(plaintext, DEK) → encrypted_data  │
+│    └─ HMAC-SHA256(plaintext, secret)  → search_index    │
 │                                                         │
 │  GET  /v1/search?national_id=X                          │
 │    └─ HMAC-SHA256(X) → WHERE search_index = ?           │
 │                            │                            │
 │                            ▼                            │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │  Database                                        │   │
-│  │  id | encrypted_data (A) | search_index (B) |.. │   │
-│  └─────────────────────────────────────────────────┘   │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Cloud SQL (MySQL 8.0)  national_ids table         │  │
+│  │                                                    │  │
+│  │  id             random hex — returned as ref       │  │
+│  │  encrypted_data AES-256-GCM ciphertext (DEK)       │  │
+│  │  storage_iv     12-byte GCM IV for encrypted_data  │  │
+│  │  search_index   HMAC-SHA256 blind index            │  │
+│  │  key_version    RSA key used for this record       │  │
+│  │  dek_version    DEK version encrypting this record │  │
+│  │  hmac_version   HMAC secret used for search_index  │  │
+│  │  created_at     UTC timestamp                      │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                         │
+│  Secret Manager: RSA key, DEK, HMAC secret, DB password │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -101,7 +118,7 @@ ephemeral key ──► RSA-OAEP(serverPublicKey) ──────────
 
 ### Key Version Support
 
-The library accepts a `keyVersion` option that is included in every payload. This allows the backend to select the correct private key during a rotation period — the client always uses the current public key but labels it so the server knows which private key to use.
+The library accepts a `keyVersion` option included in every payload. This allows the backend to select the correct private key during a rotation period — the client always uses the current public key but labels it so the server knows which private key to use for unwrapping.
 
 ---
 
@@ -109,14 +126,14 @@ The library accepts a `keyVersion` option that is included in every payload. Thi
 
 ### Blind Indexing Pattern
 
-The fundamental challenge: you need to search encrypted data without decrypting it.
+The fundamental challenge: search encrypted data without decrypting it.
 
 **Solution — two columns, two purposes:**
 
 | Column | Technique | Property | Used For |
 |--------|-----------|----------|----------|
 | `encrypted_data` | AES-256-GCM (random IV per record) | Non-deterministic | Storage — never the same ciphertext twice |
-| `search_index` | HMAC-SHA256 (fixed secret key) | Deterministic | Search — same input → same output |
+| `search_index` | HMAC-SHA256 (fixed secret) | Deterministic | Search — same input → same output |
 
 **Search flow:**
 ```
@@ -125,40 +142,56 @@ query "1234567890" ──► HMAC-SHA256(query, HMAC_SECRET)
                     WHERE search_index = <hmac_hex>
 ```
 
-The HMAC key (`HMAC_SECRET`) must be separate from the encryption key (`DATA_ENCRYPTION_KEY`) and stored in environment variables / secrets manager — never in the database.
+During an HMAC key rotation, search queries all known HMAC versions so records remain findable throughout the chunked migration window.
 
 ### Endpoint Reference
 
 ```
-POST /v1/submit
-  Body: { encrypted_data, encrypted_key, iv, key_version }
-  Response: { ref, message }
-
-GET  /v1/search?national_id=<string>
-  Response: { found, ref, created_at }
-
-GET  /health
-  Response: { status: "ok" }
+POST /v1/submit                   Decrypt E2E payload, store with blind index
+POST /v1/submit-unsafe            Same as submit but intentionally logs national_id (security demo)
+GET  /v1/search?national_id=X     Search by National ID (queries all HMAC versions)
+GET  /v1/public-key               Return current RSA public key + version
+GET  /v1/admin/status             Current key versions, record count, HMAC migration progress
+POST /v1/admin/rotate-rsa         Generate new RSA pair, hot-reload server
+POST /v1/admin/rotate-dek         Generate new DEK, re-encrypt all records
+POST /v1/admin/rotate-hmac        Generate new HMAC secret, chunked blind-index migration
+GET  /v1/admin/monitor/violations Query Cloud Logging for SECURITY_VIOLATION entries
+POST /v1/admin/reset-demo         Delete all records and reset key state to v1 (demo only)
+GET  /health                      Liveness probe
 ```
 
-### Security Controls in Code
+### Key Versioning
 
-- **No PII in logs:** The `national_id` variable is deliberately never passed to any `log.*` call
-- **Non-root Docker user:** The container runs as `uppass` user, not `root`
-- **Keys never in image:** Private keys are mounted as Docker secrets at runtime
-- **Multi-stage Dockerfile:** Build tools are stripped from the final image, reducing attack surface
+Every record stores three version columns:
+
+| Column | Tracks |
+|--------|--------|
+| `key_version` | Which RSA private key was used to unwrap the session AES key |
+| `dek_version` | Which DEK version currently encrypts `encrypted_data` |
+| `hmac_version` | Which HMAC secret was used to compute `search_index` |
+
+This enables zero-downtime key rotation — old and new records coexist and are always decryptable/searchable.
+
+### Security Controls
+
+- **No PII in logs:** `national_id` is never passed to any `log.*` call in normal operation
+- **HMAC versioning:** chunked migration; search tries all known versions during rotation window
+- **Single worker per instance:** `--workers 1` ensures in-memory key state is consistent; `--max-instances=1` prevents key-state divergence across instances
+- **Keys from Secret Manager:** private key, DEK, and HMAC secret are fetched from GCP Secret Manager at startup — never baked into the image
+- **Non-root Docker user:** container runs as `uppass`, not `root`
+- **TruffleHog in CI:** Cloud Build scans for hardcoded secrets before building Docker images
 
 ---
 
-## Running the Project
+## Running Locally
 
 ### Prerequisites
 
 - Docker & Docker Compose
-- Node.js 18+ (for frontend library)
-- Python 3.12+ (for local backend development)
+- Node.js 18+
+- Python 3.12+
 
-### 1. Generate RSA Keys
+### 1. Generate RSA Keys (first time only)
 
 ```bash
 cd backend
@@ -169,18 +202,18 @@ python scripts/generate_keys.py
 ### 2. Configure Environment
 
 ```bash
-cp .env.example .env
-# Edit .env:
-#   HMAC_SECRET=<generate with: python -c "import secrets; print(secrets.token_hex(32))">
-#   DATA_ENCRYPTION_KEY=<generate same way>
+# Create .env in project root
+HMAC_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
+DATA_ENCRYPTION_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
 ```
 
 ### 3. Run with Docker Compose
 
 ```bash
 docker compose up --build
-# API available at: http://localhost:8000
-# Docs available at: http://localhost:8000/docs
+# API:   http://localhost:8000
+# Docs:  http://localhost:8000/docs
+# UI:    http://localhost:3000
 ```
 
 ### 4. Build the TypeScript Library
@@ -192,78 +225,21 @@ npm run build
 # Output: dist/uppass-secure-bridge.js
 ```
 
-### 5. Test the Flow
-
-```bash
-# Submit encrypted data
-curl -X POST http://localhost:8000/v1/submit \
-  -H "Content-Type: application/json" \
-  -d '{"encrypted_data":"...","encrypted_key":"...","iv":"...","key_version":"v1"}'
-
-# Search by National ID
-curl "http://localhost:8000/v1/search?national_id=1234567890123"
-```
-
 ---
 
-## Deploying to the Cloud
+## Deploying to GCP
 
-> **Note on Vercel:** Vercel is optimised for stateless frontend deployments and serverless functions.
-> The Python backend is **not suited for Vercel** because it is stateful (holds RSA private keys in memory,
-> requires a persistent database connection, and uses long-lived worker processes).
-> The recommendation below reflects production-appropriate choices.
+Full step-by-step instructions are in [SETUP.md](SETUP.md).
 
-### Recommended Split Architecture
-
-```
-Frontend (TypeScript Library / Demo UI)  ──►  Vercel / Netlify
-Backend (FastAPI Service)                ──►  Railway / Render / Fly.io / AWS ECS
-Database                                 ──►  AWS RDS PostgreSQL / PlanetScale
-Secrets                                  ──►  AWS Secrets Manager / GCP Secret Manager
-```
-
-### Backend — Deploy to Railway
+### Quick rebuild + redeploy
 
 ```bash
-# Install Railway CLI
-npm install -g @railway/cli
-railway login
-railway init
-railway up
+# Rebuild both images (TruffleHog scan runs first)
+gcloud builds submit . --config=cloudbuild.yaml
 
-# Set secrets (never commit these)
-railway variables set HMAC_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
-railway variables set DATA_ENCRYPTION_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
-railway variables set DATABASE_URL=postgresql://...
-```
-
-### Backend — Deploy to AWS ECS (Production)
-
-```bash
-# 1. Push image to ECR
-aws ecr create-repository --repository-name uppass-api
-docker build -t uppass-api ./backend
-docker tag uppass-api:latest <account>.dkr.ecr.<region>.amazonaws.com/uppass-api:latest
-docker push <account>.dkr.ecr.<region>.amazonaws.com/uppass-api:latest
-
-# 2. Store private key in AWS Secrets Manager
-aws secretsmanager create-secret \
-  --name uppass/private-key-v1 \
-  --secret-string file://backend/keys/private_v1.pem
-
-# 3. Mount secret into ECS task definition (not environment variable)
-# Reference: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-secrets-manager.html
-```
-
-### Frontend Library — Publish to npm / Vercel
-
-```bash
-cd frontend-lib
-npm run build
-npm publish --access public   # publishes @uppass/secure-bridge
-
-# Or deploy demo app to Vercel
-vercel --prod
+# Redeploy both services
+gcloud run deploy uppass-api      --image=asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/backend:latest  --region=asia-southeast1
+gcloud run deploy uppass-frontend --image=asia-southeast1-docker.pkg.dev/$PROJECT_ID/uppass/frontend:latest --region=asia-southeast1
 ```
 
 ---
@@ -272,67 +248,68 @@ vercel --prod
 
 ### Problem
 
-> Rotate Data Encryption Keys (DEK) annually for compliance.  
+> Rotate Data Encryption Keys (DEK) and HMAC secrets for compliance.
 > Millions of encrypted records exist. Zero downtime required.
 
-### Solution: Key Versioning + Envelope Encryption
+### Implemented Solution
+
+The service implements live, hot-reloadable key rotation via admin endpoints:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Key Hierarchy                                           │
-│                                                          │
-│  KMS / Vault                                             │
-│    ├── KEK (Key Encryption Key) — never rotated          │
-│    ├── DEK v1 — encrypted by KEK, used until 2025-01-01  │
-│    └── DEK v2 — encrypted by KEK, current key            │
-│                                                          │
-│  Database Record                                         │
-│    ├── encrypted_data  (ciphertext)                      │
-│    ├── key_version     ← "v1" or "v2"                    │
-│    └── search_index    (HMAC — unaffected by rotation)   │
-└──────────────────────────────────────────────────────────┘
+POST /v1/admin/rotate-rsa   → new RSA pair, hot-reloads without restart
+POST /v1/admin/rotate-dek   → new DEK, re-encrypts all records in one pass
+POST /v1/admin/rotate-hmac  → new HMAC secret, recomputes blind indexes in chunks
 ```
 
-### Zero-Downtime Rotation Procedure
+#### RSA Rotation
 
 ```
-Phase 1 — Preparation (Day 0)
-  ├─ Generate DEK v2 in KMS
-  ├─ Update app config: CURRENT_WRITE_VERSION = "v2"
-  ├─ Add v2 to decryption key map (app can now decrypt v1 and v2)
-  └─ Deploy — all NEW records are written with v2; reads work for both
-
-Phase 2 — Background Migration (Days 1–N)
-  ├─ Migration job runs in batches (e.g., 1,000 records / 5 seconds)
-  │     for record in db.where(key_version="v1").batch(1000):
-  │         plaintext = aes_decrypt(record.encrypted_data, DEK_v1)
-  │         record.encrypted_data = aes_encrypt(plaintext, DEK_v2)
-  │         record.key_version = "v2"
-  │         db.save(record)
-  └─ Job is idempotent — safe to stop and restart
-
-Phase 3 — Cleanup (After 100% migration confirmed)
-  ├─ Verify: SELECT COUNT(*) WHERE key_version = "v1" → must be 0
-  ├─ Remove v1 from decryption key map
-  ├─ Archive DEK v1 (keep in cold storage for audit; do not delete yet)
-  └─ Update compliance documentation
+1. Generate RSA-2048 pair in-process
+2. Store new private key (base64) to Secret Manager as new version
+3. Hot-reload: add new private key to state.private_keys[new_version]
+4. Set state.current_rsa_version = new_version
+   → New submits use new public key; old records still decrypt with old private key
 ```
+
+#### DEK Rotation
+
+```
+1. Generate 256-bit DEK (SHA256 of random hex)
+2. Store raw hex to Secret Manager
+3. For every record:
+     plaintext = aes_gcm_decrypt(record.encrypted_data, old_dek)
+     record.encrypted_data = aes_gcm_encrypt(plaintext, new_dek)
+     record.dek_version = new_version
+4. Hot-reload: state.dek_keys[new_version] = new_dek
+```
+
+#### HMAC Rotation (chunked)
+
+```
+POST /v1/admin/rotate-hmac  body: { "chunk_size": 1000 }
+
+Response: { new_version, recomputed_records, remaining_records, message }
+
+1. Generate new HMAC secret, store to Secret Manager
+2. Process chunk_size records where hmac_version != new_version:
+     plaintext = aes_gcm_decrypt(record.encrypted_data, DEK)
+     record.search_index = hmac_sha256(plaintext, new_secret)
+     record.hmac_version = new_version
+3. Call repeatedly until remaining_records = 0
+   → Search works across all versions during the migration window
+```
+
+The demo frontend loops automatically until all records are migrated.
 
 ### How the System Knows Which Key to Use
 
-Every record stores `key_version` as a plain (non-encrypted) column. The decryption path is:
+Every record stores plain (non-encrypted) version columns. The read path is:
 
 ```python
 def decrypt_record(record):
-    dek = kms.get_key(version=record.key_version)   # O(1) lookup from in-memory cache
+    dek = state.dek_keys[record.dek_version]        # in-memory dict lookup
     return aes_gcm_decrypt(record.encrypted_data, dek)
 ```
-
-The KMS client caches key material locally to avoid a network call per record during the migration job.
-
-### HMAC Search Index During Rotation
-
-The `search_index` (HMAC) is **unaffected by key rotation** because it is derived from the HMAC secret, not the DEK. This means the search capability remains fully functional throughout the entire migration.
 
 ---
 
@@ -340,8 +317,19 @@ The `search_index` (HMAC) is **unaffected by key rotation** because it is derive
 
 ### Incident
 
-> A developer accidentally logged the decrypted National ID into CloudWatch/Stackdriver  
+> A developer accidentally logged the decrypted National ID into Cloud Run stdout
 > for the past 24 hours.
+
+### Live Demo
+
+The `/v1/submit-unsafe` endpoint simulates this mistake — it processes the submission correctly but intentionally logs `national_id` to stdout. The frontend "Security Monitor" module:
+
+1. Submits via the unsafe endpoint to create a violation
+2. Polls `/v1/admin/monitor/violations` which queries Cloud Logging for `SECURITY_VIOLATION` entries
+3. Shows a live feed with timestamp, severity, and payload
+4. Links to GCP Logs Explorer, Metrics Explorer, and Alert Policies console
+
+A GCP log-based metric (`uppass-pii-leak`) counts these violations, and an alerting policy fires an email to the team when the count exceeds 0.
 
 ---
 
@@ -349,18 +337,19 @@ The `search_index` (HMAC) is **unaffected by key rotation** because it is derive
 
 ```
 T+0   CONTAIN ──► Redeploy the service with the logging statement removed
-                  Rate-limit or temporarily suspend the affected endpoint
-                  Revoke any developer access to the logging system
+                  Remove or disable the unsafe endpoint
+                  Revoke developer access to the logging system
 
-T+10  ASSESS ───► Query CloudWatch for the past 24h:
-                  fields @message | filter message like /national.?id/i
-                  → Determine: how many unique IDs, which users, what regions
+T+10  ASSESS ───► Query Cloud Logging:
+                  gcloud logging read \
+                    'resource.type="cloud_run_revision" AND textPayload=~"national_id"' \
+                    --limit=1000
+                  → Determine: how many unique IDs, which time window
 
 T+20  ESCALATE ──► Notify: DPO, Legal, CISO, Engineering Director
-                   Open an incident channel (Slack #incident-YYYY-MM-DD)
-                   Do NOT post PII data into the incident channel
+                   Open an incident channel — do NOT post PII into it
 
-T+30  PRESERVE ──► Export and secure affected log streams for legal/forensic use
+T+30  PRESERVE ──► Export affected log streams for legal/forensic use
                    BEFORE requesting deletion (deletion is irreversible)
 ```
 
@@ -368,9 +357,11 @@ T+30  PRESERVE ──► Export and secure affected log streams for legal/forens
 
 ```
 Step 1 — Log Purge
-  ├─ AWS CloudWatch: aws logs delete-log-group --log-group-name <group>
-  │    or create a log export job, purge, then reimport sanitised copy
-  └─ Confirm deletion with audit trail (screenshot + ticket reference)
+  Cloud Logging entries are immutable — they cannot be selectively edited.
+  Options:
+    a. Set a log exclusion filter to stop ingesting future violations
+    b. Reduce log bucket retention to expire old entries faster
+    c. Export to GCS, sanitise (replace national IDs), reimport if needed for audit
 
 Step 2 — Regulatory Notification
   ├─ PDPA (Thailand): notify PDPC within 72 hours of discovery
@@ -389,15 +380,14 @@ Step 3 — Affected Data Assessment
 ```python
 import re, logging
 
-NATIONAL_ID_PATTERN = re.compile(r'\b\d{13}\b')   # Thai National ID pattern
+NATIONAL_ID_PATTERN = re.compile(r'\b\d{13}\b')   # Thai National ID
 
 class PIIScrubFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = NATIONAL_ID_PATTERN.sub('[REDACTED]', str(record.msg))
+        record.msg  = NATIONAL_ID_PATTERN.sub('[REDACTED]', str(record.msg))
         record.args = ()
         return True
 
-# Apply globally at app startup
 for handler in logging.root.handlers:
     handler.addFilter(PIIScrubFilter())
 ```
@@ -409,12 +399,20 @@ for handler in logging.root.handlers:
 log.info("Processing record: %s", record.__dict__)
 
 # ✅ CORRECT — log only safe, explicitly chosen fields
-log.info("Processing record ref=%s key_version=%s", record.id, record.key_version)
+log.info("Stored record ref=%s key_version=%s", record.id, record.key_version)
 ```
 
-#### 3. CI Static Analysis Rule
+#### 3. TruffleHog in Cloud Build (already implemented)
 
-Add a custom lint rule (e.g., `flake8` plugin or `semgrep`) that fails the build if any `log.*()` call appears inside a function named `decrypt*` or handles a variable named `national_id` or `plaintext`.
+```yaml
+# cloudbuild.yaml — step 1 blocks the build if secrets are found
+- id: secret-scan
+  name: trufflesecurity/trufflehog:latest
+  args: [filesystem, /workspace, --fail, --no-update,
+         --exclude-paths=/workspace/.trufflehog-exclude]
+```
+
+#### 4. Semgrep Rule — No PII in Logs
 
 ```yaml
 # .semgrep.yml
@@ -427,38 +425,18 @@ rules:
     severity: ERROR
 ```
 
-#### 4. Code Review Checklist (PR Template)
+#### 5. GCP Monitoring Alert (already implemented)
 
-```markdown
-## Security Checklist
-- [ ] No PII (National ID, name, phone, email) passed to any log statement
-- [ ] New environment variables documented and added to Secrets Manager
-- [ ] No secrets committed to repository
-- [ ] Decryption logic reviewed by a second engineer
-```
-
-#### 5. Secret Detection in CI
-
-```yaml
-# .github/workflows/security.yml
-- name: Detect secrets
-  uses: trufflesecurity/trufflehog@v3
-  with:
-    path: ./
-    base: main
-```
+A log-based metric `uppass-pii-leak` counts `SECURITY_VIOLATION` log entries. An alerting policy fires an email immediately when the count exceeds 0, giving the team real-time visibility rather than discovering the leak hours later.
 
 ### Post-Incident Review (1 Week Later)
 
 Hold a blameless post-mortem. Document:
 
 - **Root cause:** logging statement added during debugging, not caught in review
-- **Contributing factors:** no log scrubbing middleware, no lint rule
+- **Contributing factors:** no log scrubbing middleware, no lint rule, no real-time alerting
 - **Action items with owners and deadlines:** middleware (Platform team, 3 days), semgrep rule (Security team, 1 week), PR checklist update (Tech Lead, 1 day)
-
-The goal is systemic improvement — not individual blame.
 
 ---
 
-*Document authored for UpPass Technical Lead Assignment*  
 *All cryptographic primitives follow NIST SP 800-38D (AES-GCM) and PKCS #1 v2.2 (OAEP)*
