@@ -126,9 +126,13 @@
           active for unprocessed records during the migration window.
         </div>
         <label style="color:#8b949e;font-size:12px;margin-top:8px">Chunk size (records per call)</label>
-        <input id="dekChunkSize" type="number" value="100" min="1" max="50000"
+        <input id="dekChunkSize" type="number" value="3" min="1" max="50000"
                style="width:120px;margin-top:4px" />
-        <button class="warn" onclick="rotateDEK()" id="btnDEK">Generate &amp; Rotate DEK</button>
+        <label style="display:flex;align-items:center;gap:6px;color:#8b949e;font-size:12px;margin-top:8px;cursor:pointer">
+          <input type="checkbox" id="dekAutoLoop" style="width:auto;margin:0" />
+          Auto-loop until complete
+        </label>
+        <button class="warn" onclick="rotateDEK()" id="btnDEK">Run One Chunk</button>
         <pre id="dekOut">—</pre>
       </div>
 
@@ -141,9 +145,13 @@
           across all HMAC versions during the migration window.
         </div>
         <label style="color:#8b949e;font-size:12px;margin-top:8px">Chunk size (records per call)</label>
-        <input id="hmacChunkSize" type="number" value="100" min="1" max="50000"
+        <input id="hmacChunkSize" type="number" value="3" min="1" max="50000"
                style="width:120px;margin-top:4px" />
-        <button onclick="rotateHMAC()" id="btnHMAC">Generate &amp; Rotate HMAC</button>
+        <label style="display:flex;align-items:center;gap:6px;color:#8b949e;font-size:12px;margin-top:8px;cursor:pointer">
+          <input type="checkbox" id="hmacAutoLoop" style="width:auto;margin:0" />
+          Auto-loop until complete
+        </label>
+        <button onclick="rotateHMAC()" id="btnHMAC">Run One Chunk</button>
         <pre id="hmacOut">—</pre>
       </div>
 
@@ -306,7 +314,8 @@
     window.rotateDEK = async function () {
       const out       = document.getElementById("dekOut");
       const btn       = document.getElementById("btnDEK");
-      const chunkSize = parseInt(document.getElementById("dekChunkSize").value) || 100;
+      const chunkSize = parseInt(document.getElementById("dekChunkSize").value) || 3;
+      const autoLoop  = document.getElementById("dekAutoLoop").checked;
       btn.disabled = true;
 
       let totalReencrypted = 0;
@@ -314,7 +323,7 @@
       let callCount        = 0;
 
       try {
-        while (true) {
+        do {
           callCount++;
           out.textContent = `Migrating… (call #${callCount}, re-encrypted so far: ${totalReencrypted})`;
 
@@ -329,16 +338,20 @@
           newVersion        = data.new_version;
           totalReencrypted += data.reencrypted_records;
 
-          if (data.remaining_records === 0) {
-            out.innerHTML = '<span class="tag ok">Complete</span>\n' + JSON.stringify({
-              new_version:       newVersion,
-              total_reencrypted: totalReencrypted,
-              calls_needed:      callCount,
-              message:           data.message,
-            }, null, 2);
-            break;
-          }
-        }
+          const done = data.remaining_records === 0;
+          const tag  = done ? '<span class="tag ok">Complete</span>' : '<span class="tag warn-tag">Partial</span>';
+          out.innerHTML = tag + "\n" + JSON.stringify({
+            new_version:       newVersion,
+            reencrypted_this:  data.reencrypted_records,
+            total_reencrypted: totalReencrypted,
+            remaining:         data.remaining_records,
+            calls_made:        callCount,
+            message:           data.message,
+          }, null, 2);
+
+          if (done) break;
+        } while (autoLoop);
+
         await refreshStatus();
       } catch (e) {
         out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
@@ -433,7 +446,8 @@
     window.rotateHMAC = async function () {
       const out       = document.getElementById("hmacOut");
       const btn       = document.getElementById("btnHMAC");
-      const chunkSize = parseInt(document.getElementById("hmacChunkSize").value) || 100;
+      const chunkSize = parseInt(document.getElementById("hmacChunkSize").value) || 3;
+      const autoLoop  = document.getElementById("hmacAutoLoop").checked;
       btn.disabled = true;
 
       let totalRecomputed = 0;
@@ -441,7 +455,7 @@
       let callCount       = 0;
 
       try {
-        while (true) {
+        do {
           callCount++;
           out.textContent = `Migrating… (call #${callCount}, recomputed so far: ${totalRecomputed})`;
 
@@ -456,16 +470,20 @@
           newVersion       = data.new_version;
           totalRecomputed += data.recomputed_records;
 
-          if (data.remaining_records === 0) {
-            out.innerHTML = '<span class="tag ok">Complete</span>\n' + JSON.stringify({
-              new_version: newVersion,
-              total_recomputed: totalRecomputed,
-              calls_needed: callCount,
-              message: data.message,
-            }, null, 2);
-            break;
-          }
-        }
+          const done = data.remaining_records === 0;
+          const tag  = done ? '<span class="tag ok">Complete</span>' : '<span class="tag warn-tag">Partial</span>';
+          out.innerHTML = tag + "\n" + JSON.stringify({
+            new_version:      newVersion,
+            recomputed_this:  data.recomputed_records,
+            total_recomputed: totalRecomputed,
+            remaining:        data.remaining_records,
+            calls_made:       callCount,
+            message:          data.message,
+          }, null, 2);
+
+          if (done) break;
+        } while (autoLoop);
+
         await refreshStatus();
       } catch (e) {
         out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
