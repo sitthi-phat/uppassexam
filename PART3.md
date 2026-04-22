@@ -10,159 +10,264 @@
 
 ---
 
-### Core Principle: Key Versioning
+### Core Principle: Three Version Columns
 
-Every encrypted record carries a `dek_version` column — a plain (non-encrypted) label stored alongside the ciphertext. During a rotation, old and new records coexist in the database. The system reads the version label to select the correct key for decryption, with no guessing or trial-and-error.
-
-```
-national_ids table
-┌────────┬────────────────┬────────────┬─────────────┐
-│   id   │ encrypted_data │ storage_iv │ dek_version │
-├────────┼────────────────┼────────────┼─────────────┤
-│ a1b2…  │ <ciphertext>   │ <iv>       │    v1       │  ← old record, DEK v1
-│ c3d4…  │ <ciphertext>   │ <iv>       │    v2       │  ← new record, DEK v2
-│ e5f6…  │ <ciphertext>   │ <iv>       │    v1       │  ← old record, still v1
-└────────┴────────────────┴────────────┴─────────────┘
-```
-
----
-
-### Zero-Downtime Rotation Architecture
+Every record carries three plain (non-encrypted) version labels — one per key type. During any rotation, old and new records coexist. The system reads the label to select the exact key, with no guessing.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Secret Manager                               │
-│                                                                     │
-│   uppass-dek  version 1 ──► raw hex of DEK v1  (ENABLED)           │
-│   uppass-dek  version 2 ──► raw hex of DEK v2  (ENABLED, current)  │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │  loaded at startup / rotation
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     API Server (Cloud Run)                          │
-│                                                                     │
-│   state.dek_keys = {                                                │
-│       "v1": bytes(sha256(hex_v1)),   ← retained for decryption      │
-│       "v2": bytes(sha256(hex_v2)),   ← current write key            │
-│   }                                                                 │
-│   state.current_dek_version = "v2"                                  │
-│                                                                     │
-│   READ path:                                                        │
-│     key = state.dek_keys[record.dek_version]   ← always correct    │
-│     plaintext = aes_gcm_decrypt(record.data, key, record.iv)        │
-│                                                                     │
-│   WRITE path:                                                       │
-│     key = state.dek_keys[state.current_dek_version]                 │
-│     record.encrypted_data = aes_gcm_encrypt(plaintext, key)         │
-│     record.dek_version    = state.current_dek_version               │
-└─────────────────────────────────────────────────────────────────────┘
+national_ids table (Cloud SQL MySQL 8.0)
+┌────────┬────────────────┬────────────┬──────────────┬─────────────┬──────────────┬─────────────┐
+│   id   │ encrypted_data │ storage_iv │ search_index │ key_version │ dek_version  │ hmac_version│
+├────────┼────────────────┼────────────┼──────────────┼─────────────┼──────────────┼─────────────┤
+│ a1b2…  │ <ciphertext>   │ <iv>       │ <hmac_hex>   │     v1      │     v1       │     v1      │ ← original
+│ c3d4…  │ <ciphertext>   │ <iv>       │ <hmac_hex>   │     v1      │     v2       │     v1      │ ← DEK rotated
+│ e5f6…  │ <ciphertext>   │ <iv>       │ <hmac_hex>   │     v2      │     v2       │     v2      │ ← all rotated
+└────────┴────────────────┴────────────┴──────────────┴─────────────┴──────────────┴─────────────┘
+
+key_version  — which RSA private key decrypts the session AES key (set at submit time, never changes)
+dek_version  — which DEK currently encrypts encrypted_data       (updated by rotate-dek)
+hmac_version — which HMAC secret produced search_index           (updated by rotate-hmac, chunked)
 ```
 
 ---
 
-### Rotation Procedure (Zero Downtime)
+### Secret Manager Version Mapping
+
+The version label in the DB maps **directly and deterministically** to a Secret Manager version number. No lookup table, no config — just strip the `"v"` prefix.
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  PHASE 1 — Generate & Hot-Reload  (instantaneous, no downtime)   │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  POST /v1/admin/rotate-dek                                       │
-│                                                                  │
-│  1. Generate new DEK:  new_hex = secrets.token_hex(32)           │
-│                        new_key = sha256(new_hex.encode())        │
-│  2. Store to Secret Manager as new version                       │
-│  3. Add to in-memory map:  state.dek_keys["v2"] = new_key        │
-│  4. Set write pointer:     state.current_dek_version = "v2"      │
-│                                                                  │
-│  Result: new records write with v2; old records still decrypt    │
-│          with v1 — zero downtime, zero errors                    │
-└──────────────────────────────────────────────────────────────────┘
+DB label   Secret Manager secret         SM version
+─────────  ────────────────────────────  ──────────
+"v1"       uppass-dek                    1
+"v2"       uppass-dek                    2          ← after first DEK rotation
+"v3"       uppass-dek                    3          ← after second DEK rotation
 
-┌──────────────────────────────────────────────────────────────────┐
-│  PHASE 2 — Background Re-encryption  (batched, non-blocking)     │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  for record in db.where(dek_version != "v2").batch(1000):        │
-│      plaintext            = aes_gcm_decrypt(record, DEK_v1)      │
-│      record.encrypted_data = aes_gcm_encrypt(plaintext, DEK_v2)  │
-│      record.storage_iv    = new_random_iv                        │
-│      record.dek_version   = "v2"                                 │
-│      db.save(record)                                             │
-│                                                                  │
-│  Properties:                                                     │
-│    • Reads and writes continue normally throughout               │
-│    • Job is idempotent — safe to stop, restart, or parallelize   │
-│    • Each batch is a separate DB transaction                     │
-└──────────────────────────────────────────────────────────────────┘
+"v1"       uppass-hmac-secret            1
+"v2"       uppass-hmac-secret            2          ← after first HMAC rotation
 
-┌──────────────────────────────────────────────────────────────────┐
-│  PHASE 3 — Cleanup  (after 100 % migration confirmed)            │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. Verify:  SELECT COUNT(*) WHERE dek_version = "v1"  → must = 0│
-│  2. Remove v1 from state.dek_keys                                │
-│  3. Disable Secret Manager version 1 of uppass-dek               │
-│     (keep disabled for 90-day audit window, then destroy)        │
-│  4. Update compliance documentation                              │
-└──────────────────────────────────────────────────────────────────┘
+"v1"       uppass-private-key-v1-b64     1
+"v2"       uppass-private-key-v1-b64     2          ← after first RSA rotation
+```
+
+This makes restarts deterministic: given the DB label `"vN"`, the system always fetches SM version `N` — no env var drift, no guessing.
+
+---
+
+### Zero-Downtime Architecture
+
+```
+                      ┌──────────────────────────────────────────────────────────┐
+                      │                   Secret Manager                         │
+                      │                                                          │
+                      │  uppass-dek          ver 1 → DEK v1 raw hex (ENABLED)   │
+                      │                      ver 2 → DEK v2 raw hex (ENABLED)   │
+                      │                                                          │
+                      │  uppass-hmac-secret  ver 1 → HMAC v1 secret (ENABLED)   │
+                      │                      ver 2 → HMAC v2 secret (ENABLED)   │
+                      │                                                          │
+                      │  uppass-private-key  ver 1 → RSA v1 base64 (ENABLED)    │
+                      │  -v1-b64             ver 2 → RSA v2 base64 (ENABLED)    │
+                      └────────────────────────────┬─────────────────────────────┘
+                                                   │
+                          At startup: for each key type
+                          1. SELECT DISTINCT <ver_col> FROM national_ids
+                          2. for "vN" → fetch SM version N
+                          3. load into state dict
+                                                   │
+                                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                            API Server (Cloud Run)                                │
+│                                                                                  │
+│   state.dek_keys     = { "v1": sha256(hex1),  "v2": sha256(hex2)  }             │
+│   state.hmac_secrets = { "v1": b"secret_v1",  "v2": b"secret_v2"  }             │
+│   state.private_keys = { "v1": <RSA key v1>,  "v2": <RSA key v2>  }             │
+│                                                                                  │
+│   state.current_dek_version  = "v2"   ← max version label in DB                 │
+│   state.current_hmac_version = "v2"                                              │
+│   state.current_rsa_version  = "v2"                                              │
+│                                                                                  │
+│   READ  → state.dek_keys[record.dek_version]         always correct              │
+│   WRITE → state.dek_keys[state.current_dek_version]  always newest               │
+└──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### State During Transition
+### Startup Key Loading (actual implementation)
+
+```python
+def _db_distinct_versions(column: str) -> set:
+    rows = conn.execute(
+        f"SELECT DISTINCT {column} FROM national_ids WHERE {column} IS NOT NULL"
+    ).fetchall()
+    return {row[0] for row in rows if row[0]}
+
+def init_dek() -> None:
+    versions = _db_distinct_versions("dek_version")
+    versions.add("v1")                                   # always need v1 for empty DB
+
+    for ver in sorted(versions, key=lambda v: int(v[1:])):
+        ver_num = int(ver[1:])                           # "v2" → 2
+        try:
+            raw = _load_secret_version("uppass-dek", ver_num)   # fetch SM version N
+            state.dek_keys[ver] = hashlib.sha256(raw.encode()).digest()
+        except Exception:
+            if ver == "v1":                              # local dev fallback only
+                raw = os.environ.get("DATA_ENCRYPTION_KEY", "")
+                if raw:
+                    state.dek_keys["v1"] = hashlib.sha256(raw.encode()).digest()
+
+    state.current_dek_version = max(state.dek_keys, key=lambda v: int(v[1:]))
+
+# init_hmac() and load_private_keys() follow the identical pattern
+# using "uppass-hmac-secret" and "uppass-private-key-v1-b64" respectively
+```
+
+**Before this fix:** `init_dek` loaded ONE key from `DATA_ENCRYPTION_KEY` env var (always the original v1 bytes) and labeled it with whatever version was in the DB. After a rotation the env var still held v1's hex, so v1's key was stored under label `"v2"` — every decrypt of a v2 record silently failed after restart.
+
+**After this fix:** env var is only a last-resort fallback for v1 when SM is unreachable (local dev without GCP). Every other version is fetched from SM by its exact version number.
+
+---
+
+### DEK Rotation Procedure
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  PHASE 1 — Generate & Hot-Reload  (instantaneous, zero downtime)     │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  POST /v1/admin/rotate-dek                                           │
+│                                                                      │
+│  1. new_raw_hex = secrets.token_hex(32)                              │
+│     new_dek     = sha256(new_raw_hex.encode())   # 32-byte AES key   │
+│  2. _store_secret_version("uppass-dek", new_raw_hex)                 │
+│     → stored as SM version N+1                                       │
+│  3. state.dek_keys[new_ver]     = new_dek                            │
+│     state.current_dek_version   = new_ver                            │
+│                                                                      │
+│  ✓ New submits write with new_ver                                    │
+│  ✓ Old records still decrypt with old key (still in state dict)      │
+│  ✓ Any future restart loads both from SM                             │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  PHASE 2 — Re-encryption  (runs within the same request)             │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Current implementation: re-encrypts all records in one pass.        │
+│  For millions of records in production, replace with a background    │
+│  batch job that processes chunks (same pattern as HMAC rotation):    │
+│                                                                      │
+│  for record in db.where(dek_version != new_ver).batch(1000):         │
+│      plaintext             = aes_gcm_decrypt(record, old_dek)        │
+│      record.encrypted_data = aes_gcm_encrypt(plaintext, new_dek)     │
+│      record.storage_iv     = new_random_iv        # fresh IV         │
+│      record.dek_version    = new_ver                                 │
+│      db.save(record)                                                 │
+│                                                                      │
+│  • Reads and writes continue normally throughout                     │
+│  • Idempotent — safe to stop, restart, or parallelize                │
+│  • Each batch is a separate DB transaction                           │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  PHASE 3 — Cleanup  (after migration confirmed 100 %)                │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  1. Verify:  SELECT COUNT(*) WHERE dek_version = old_ver → must = 0  │
+│  2. Disable SM version N of uppass-dek                               │
+│     (keep 90 days for audit, then destroy)                           │
+│  3. Update compliance documentation                                  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### State During DEK Transition
 
 ```
 Time ──────────────────────────────────────────────────────────────►
 
-           rotate-dek called          migration complete
-                 │                           │
-  v1 only        ▼    v1 + v2 coexist        ▼   v2 only
-  ───────────────┬─────────────────────────────┬──────────────────
-  All records v1 │  Old: v1  New writes: v2    │  All records v2
-                 │  Reads: both keys needed    │  v1 key removed
-                 │                             │
-                 └─── migration job runs ──────┘
-                      (can take hours/days for millions of records)
+        rotate-dek called             re-encryption done
+              │                              │
+ v1 only      ▼   v1 + v2 in state           ▼   v2 only
+ ─────────────┬──────────────────────────────┬─────────────────────
+ All DB: v1   │  DB: v1 + v2                 │  DB: all v2
+              │  state.dek_keys = {v1, v2}   │  v1 SM version disabled
+              │  new writes: v2              │
+              │  old reads:  v1 still works  │
+              │                              │
+              └─── re-encryption batch ──────┘
+                   (minutes for demo; hours/days for millions)
+
+Restarts during this window:
+  init_dek queries DB → finds {v1, v2} → loads both from SM → correct
 ```
 
 ---
 
-### HMAC Blind Index Rotation
+### HMAC Blind Index Rotation (Chunked)
 
-The `search_index` column uses a separate HMAC secret — independent of the DEK. Rotating it follows the same versioning pattern but with an additional constraint: the blind index must be recomputed (not just re-encrypted), so the entire record must be decrypted, the new HMAC computed, and the new index written back.
+The `search_index` column uses a separate HMAC secret — independent of the DEK. The blind index cannot simply be re-encrypted; the record must be fully decrypted, then the new HMAC computed over the plaintext and written back.
 
 ```
 POST /v1/admin/rotate-hmac  { "chunk_size": 1000 }
 
-Response: {
-  "new_version":        "v2",
-  "recomputed_records": 1000,
-  "remaining_records":  45230,
-  "message":            "Chunk complete. Call again to continue."
-}
+First call  → generates new secret, stores to SM, begins migration
+              { new_version: "v2", recomputed_records: 1000, remaining_records: 45230 }
+
+Subsequent  → continues migrating remaining old-version records
+              { new_version: "v2", recomputed_records: 1000, remaining_records: 44230 }
+
+Final call  → { new_version: "v2", recomputed_records: 230, remaining_records: 0 }
 ```
 
-During migration, **search queries all known HMAC versions** in parallel so no record becomes unfindable:
+**Search during migration** — `state.hmac_secrets` is a dict loaded from SM at startup, same pattern as `dek_keys`. Search tries every version so no record becomes unfindable:
 
 ```python
-for ver, secret in state.hmac_keys.items():
-    index = hmac_sha256(national_id, secret)
-    results = db.where(search_index=index)
-    if results:
-        return results
+# state after HMAC rotation (both versions loaded from SM at startup)
+state.hmac_secrets = {
+    "v1": b"original_secret_hex",   # old records still use this search_index
+    "v2": b"new_secret_hex",        # new / migrated records use this
+}
+
+# search endpoint — tries newest version first, falls back to older
+def search(national_id: str, db):
+    for ver in sorted(state.hmac_secrets, key=lambda v: int(v[1:]), reverse=True):
+        blind = hmac_sha256(national_id, state.hmac_secrets[ver])
+        record = db.filter(search_index == blind).first()
+        if record:
+            return found(record)
+    return not_found()
+```
+
+```
+State during HMAC migration (same process or after restart):
+─────────────────────────────────────────────────────────────
+Record a1b2  hmac_version="v1"  → search tries v2 (miss) → tries v1 (hit) ✓
+Record c3d4  hmac_version="v2"  → search tries v2 (hit)                   ✓
+New submit   hmac_version="v2"  → written with v2 HMAC                    ✓
 ```
 
 ---
 
 ### Key Derivation
 
-All DEK values use `SHA-256(raw_hex)` as the actual AES key. The raw hex is what is stored in Secret Manager. This ensures the AES key is always exactly 32 bytes regardless of the input length, and the derivation is deterministic across restarts.
+DEK: `SHA-256(raw_hex_string)` → 32-byte AES key. The raw hex is stored in Secret Manager; the derived key is never persisted.
 
 ```python
-raw_hex = secret_manager.get("uppass-dek")      # "a3f9…" (64 hex chars)
-aes_key = hashlib.sha256(raw_hex.encode()).digest()  # 32 bytes
+raw_hex = "a3f9bc…"                              # 64-char hex, stored in SM
+aes_key = hashlib.sha256(raw_hex.encode()).digest()  # 32 bytes, in memory only
 ```
+
+HMAC: raw bytes of the secret string, used directly as the HMAC key.
+
+```python
+raw = "d8e2fa…"                  # stored in SM
+hmac_key = raw.encode("utf-8")   # bytes, in memory only
+```
+
+Both are deterministic: given the same SM version, every restart produces the same key.
 
 ---
 
@@ -170,11 +275,13 @@ aes_key = hashlib.sha256(raw_hex.encode()).digest()  # 32 bytes
 
 | Requirement | How it is met |
 |-------------|---------------|
-| Annual DEK rotation | `POST /v1/admin/rotate-dek` generates and hot-reloads a new key |
-| Zero downtime | Phase 1 is instantaneous; Phase 2 runs in background |
-| Auditability | Every record carries its own `dek_version`; Secret Manager logs all access |
-| Old key retention | v1 kept in memory and Secret Manager (disabled) during migration window |
-| Search continuity | HMAC versioning keeps all records searchable throughout migration |
+| Annual DEK rotation | `POST /v1/admin/rotate-dek` — generates, stores to SM as new version, hot-reloads, re-encrypts |
+| Zero downtime (live rotation) | Old key stays in `state.dek_keys`; new writes use new key immediately |
+| Zero downtime (after restart) | `init_dek` queries DB for all `dek_version` labels, fetches each from SM by version number |
+| HMAC rotation — no search disruption | `state.hmac_secrets` dict; search tries all versions; all reloaded from SM on restart |
+| Auditability | Every record carries its own `dek_version`, `hmac_version`, `key_version`; SM access logs every fetch |
+| Old key retention | Previous SM versions stay ENABLED during migration; disabled only after `COUNT(old_ver) = 0` |
+| Deterministic state reconstruction | Version label `"vN"` = SM version `N` — no env var drift, no config lookup, no guessing |
 
 ---
 ---
@@ -187,15 +294,35 @@ aes_key = hashlib.sha256(raw_hex.encode()).digest()  # 32 bytes
 
 ---
 
+### Live Demo in This Project
+
+The `/v1/submit-unsafe` endpoint simulates exactly this mistake. It processes the payload correctly but intentionally writes:
+
+```
+WARNING SECURITY_VIOLATION: national_id=1234567890123 logged by unsafe endpoint
+```
+
+The frontend **Security Monitor** module:
+- Triggers the leak via "Submit Unsafe" button
+- Polls `/v1/admin/monitor/violations` → queries Cloud Logging for `SECURITY_VIOLATION` entries
+- Displays a live feed with timestamp, severity, payload
+- Links to GCP Logs Explorer, Metrics Explorer, and Alert Policies
+
+A log-based metric (`uppass-pii-leak`) counts violations. An alerting policy fires an email within ~60 seconds of the first entry appearing.
+
+---
+
 ### Incident Timeline & Immediate Actions
 
 ```
 T + 0 min   CONTAIN
-            ├─ Identify the offending code path (log statement inside decrypt/submit handler)
-            ├─ Redeploy the service immediately with the log line removed
-            │    gcloud run deploy uppass-api --image=<fixed-image> --region=asia-southeast1
-            └─ If redeployment takes > 5 min: temporarily disable the affected endpoint
-                 gcloud run services update uppass-api --no-traffic (route 0% to current revision)
+            ├─ Identify offending code (log statement in decrypt/submit handler)
+            ├─ Build and deploy fixed image immediately
+            │    gcloud builds submit . --config=cloudbuild.yaml
+            │    gcloud run deploy uppass-api --image=<fixed>:latest --region=asia-southeast1
+            └─ If deploy takes > 5 min: route 0 % traffic to current revision
+                 gcloud run services update-traffic uppass-api \
+                   --to-revisions=LATEST=0 --region=asia-southeast1
 
 T + 10 min  ASSESS — Scope the damage
             ├─ Query Cloud Logging for the full 24-hour window:
@@ -207,26 +334,27 @@ T + 10 min  ASSESS — Scope the damage
             │      --format="value(timestamp,textPayload)" > /tmp/leak-audit.txt
             │
             ├─ Determine:
-            │    • Total unique national IDs exposed
-            │    • Time window (exact first and last log entry)
-            │    • Which Cloud Run revision introduced the bug
-            │    • Whether log entries were exported to any log sink (BigQuery, GCS, Pub/Sub)
-            └─ Do NOT delete logs yet — they are evidence
+            │    • Total unique national IDs in the log
+            │    • Exact first and last timestamp of exposure
+            │    • Which Cloud Run revision introduced the bug (gcloud run revisions list)
+            │    • Whether any log sinks (BigQuery, GCS, Pub/Sub) ingested the entries
+            └─ Do NOT delete logs yet — they are legal evidence
 
 T + 20 min  ESCALATE
-            ├─ Notify: DPO (Data Protection Officer), CISO, Legal, Engineering Director
-            ├─ Open a dedicated incident channel (e.g., Slack #inc-2026-04-21-pii-leak)
-            ├─ Rule: NO plaintext national IDs in the incident channel — reference by count/range only
-            └─ Assign an Incident Commander and a Scribe
+            ├─ Notify: DPO, CISO, Legal, Engineering Director
+            ├─ Open incident channel — e.g. Slack #inc-2026-04-22-pii-leak
+            ├─ Rule: NO plaintext national IDs in the channel — reference count/range only
+            └─ Assign Incident Commander and Scribe
 
-T + 30 min  PRESERVE — Secure evidence before any deletion
-            ├─ Export the affected log entries to a restricted GCS bucket (legal hold)
-            │    gcloud logging sinks create inc-2026-04-21-hold \
+T + 30 min  PRESERVE — evidence before any deletion
+            ├─ Export affected log entries to a restricted GCS bucket (legal hold):
+            │    gcloud logging sinks create inc-hold-2026-04-22 \
             │      storage.googleapis.com/uppass-incident-hold \
-            │      --log-filter='...'
-            └─ Screenshot log entries in GCP Console with timestamps for the legal record
+            │      --log-filter='resource.labels.service_name="uppass-api"
+            │                    AND textPayload=~"national_id"'
+            └─ Screenshot GCP Console log entries with timestamps for legal record
 
-T + 60 min  NOTIFY (if required by regulation)
+T + 60 min  NOTIFY (regulatory obligation)
             ├─ PDPA Thailand: notify PDPC within 72 hours of discovery
             ├─ GDPR (if applicable): notify supervisory authority within 72 hours
             └─ Draft affected-individual notification letters (coordinate with Legal)
@@ -237,49 +365,45 @@ T + 60 min  NOTIFY (if required by regulation)
 ### Remediation Steps
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│  Step 1 — Stop the bleeding                                        │
-│                                                                    │
-│  Remove the log statement, redeploy.                               │
-│  Verify with a test request that national_id no longer appears     │
-│  in logs before declaring containment complete.                    │
-└────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│  Step 1 — Stop the bleeding                                            │
+│                                                                        │
+│  Remove the log statement, deploy the fix.                             │
+│  Send a test request and confirm national_id no longer appears in      │
+│  Cloud Logging before declaring containment complete.                  │
+└────────────────────────────────────────────────────────────────────────┘
 
-┌────────────────────────────────────────────────────────────────────┐
-│  Step 2 — Log purge / retention                                    │
-│                                                                    │
-│  Cloud Logging entries are immutable — they cannot be edited or    │
-│  selectively deleted via the API.                                  │
-│                                                                    │
-│  Options (choose based on legal/audit requirements):               │
-│                                                                    │
-│  a. Shorten log bucket retention                                   │
-│       gcloud logging buckets update _Default \                     │
-│         --location=global --retention-days=1                       │
-│     Entries older than 1 day will expire automatically.            │
-│                                                                    │
-│  b. Delete entire log (nuclear — loses all entries for that log)   │
-│       gcloud logging logs delete \                                 │
-│         "projects/PROJECT/logs/run.googleapis.com%2Fstdout"        │
-│                                                                    │
-│  c. Add a log exclusion filter (stops further ingestion)           │
-│       gcloud logging sinks create /dev/null \                      │
-│         --log-filter='textPayload=~"national_id"'                  │
-│     Note: does not remove entries already written.                 │
-│                                                                    │
-│  Always preserve a secured copy for legal hold BEFORE purging.     │
-└────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│  Step 2 — Log purge                                                    │
+│                                                                        │
+│  Cloud Logging entries are immutable — they cannot be selectively      │
+│  edited or deleted. Options (apply after legal hold is secured):       │
+│                                                                        │
+│  a. Shorten log bucket retention (entries expire automatically)        │
+│       gcloud logging buckets update _Default \                         │
+│         --location=global --retention-days=1                           │
+│                                                                        │
+│  b. Delete the entire stdout log (nuclear — loses all log history)     │
+│       gcloud logging logs delete \                                     │
+│         "projects/PROJECT/logs/run.googleapis.com%2Fstdout"            │
+│                                                                        │
+│  c. Add a log exclusion to stop ingesting future PII lines             │
+│       gcloud logging sinks create pii-exclusion /dev/null \            │
+│         --log-filter='textPayload=~"national_id"'                      │
+│     (does not remove already-written entries)                          │
+│                                                                        │
+│  Always preserve the secured GCS copy BEFORE purging.                 │
+└────────────────────────────────────────────────────────────────────────┘
 
-┌────────────────────────────────────────────────────────────────────┐
-│  Step 3 — Assess affected individuals                              │
-│                                                                    │
-│  For each leaked national ID:                                      │
-│    • Cross-reference with user records to identify the person      │
-│    • Assess identity-theft risk level                              │
-│    • Prepare individual notification letters                       │
-│    • Offer credit monitoring / identity protection services        │
-│      for high-risk cases                                           │
-└────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│  Step 3 — Assess affected individuals                                  │
+│                                                                        │
+│  For each unique national ID found in the audit log:                   │
+│    • Cross-reference with DB records to identify the person            │
+│    • Assess identity-theft risk (name + ID = high risk)                │
+│    • Prepare individual notification letters                           │
+│    • Offer credit monitoring for high-risk cases                       │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -288,7 +412,7 @@ T + 60 min  NOTIFY (if required by regulation)
 
 #### Control 1 — PII Scrubbing Middleware (defence-in-depth)
 
-Even if a developer accidentally logs a variable named `national_id`, this filter replaces it before the log entry is written.
+Even if a developer accidentally logs `national_id`, this filter replaces the value before it reaches Cloud Logging.
 
 ```python
 import re, logging
@@ -301,7 +425,7 @@ class PIIScrubFilter(logging.Filter):
         record.args = ()
         return True
 
-# Apply at startup — covers every logger in the process
+# Applied at startup — covers every logger in the process
 for handler in logging.root.handlers:
     handler.addFilter(PIIScrubFilter())
 ```
@@ -310,22 +434,23 @@ for handler in logging.root.handlers:
 
 #### Control 2 — Structured Logging Allowlist
 
+**Rule: log IDs and version labels, never values.**
+
 ```python
-# ❌ WRONG — logs entire object which may contain PII
+# ❌ WRONG — entire dict may contain PII
 log.info("Processing: %s", record.__dict__)
-log.debug("Decrypted payload: %s", payload)
+log.debug("Decrypted: %s", national_id)
 
-# ✅ CORRECT — only log safe, explicitly selected fields
-log.info("Stored record ref=%s dek_version=%s", record.id, record.dek_version)
+# ✅ CORRECT — only safe fields explicitly chosen
+log.info("Stored ref=%s dek_version=%s hmac_version=%s",
+         record.id, record.dek_version, record.hmac_version)
 ```
-
-Team rule: **log IDs and version labels, never values.**
 
 ---
 
 #### Control 3 — Semgrep Static Analysis in CI
 
-Fails the pull request if any log call receives a variable named `national_id` or `plaintext`.
+Blocks the pull request if any `log.*()` call receives a variable named `national_id` or `plaintext`.
 
 ```yaml
 # .semgrep.yml
@@ -333,112 +458,122 @@ rules:
   - id: no-pii-in-logs
     languages: [python]
     patterns:
-      - pattern: logging.$FUNC(..., national_id, ...)
-      - pattern: logging.$FUNC(..., plaintext, ...)
       - pattern: log.$FUNC(..., national_id, ...)
       - pattern: log.$FUNC(..., plaintext, ...)
-    message: "PII variable passed directly to a log statement — use ref/version labels instead"
+      - pattern: logging.$FUNC(..., national_id, ...)
+      - pattern: logging.$FUNC(..., plaintext, ...)
+    message: "PII variable passed to log — use ref/version labels only"
     severity: ERROR
 ```
 
-Add to CI pipeline:
 ```yaml
+# In CI pipeline (e.g. Cloud Build step or GitHub Actions)
 - name: Semgrep PII check
-  run: semgrep --config .semgrep.yml backend/
+  run: semgrep --config .semgrep.yml backend/ --error
 ```
 
 ---
 
-#### Control 4 — TruffleHog in Cloud Build (already implemented)
+#### Control 4 — TruffleHog in Cloud Build (implemented)
 
 ```yaml
-# cloudbuild.yaml — step 1 blocks builds if secrets or tokens are found
+# cloudbuild.yaml step 1 — blocks build if any hardcoded secret is found
 - id: secret-scan
   name: trufflesecurity/trufflehog:latest
-  args: [filesystem, /workspace, --fail, --no-update,
-         --exclude-paths=/workspace/.trufflehog-exclude]
+  args:
+    - filesystem
+    - /workspace
+    - --fail
+    - --no-update
+    - --exclude-paths=/workspace/.trufflehog-exclude
 ```
+
+Both Docker image builds (`build-backend`, `build-frontend`) declare `waitFor: [secret-scan]` so they only run if the scan passes.
 
 ---
 
-#### Control 5 — GCP Real-Time Alerting (already implemented)
-
-A log-based metric fires an email alert the moment a `SECURITY_VIOLATION` entry appears in Cloud Logging — turning a 24-hour silent breach into a sub-minute notification.
+#### Control 5 — GCP Real-Time Alerting (implemented)
 
 ```
-Log entry written
-       │
-       ▼
-Cloud Logging ingests entry
-       │
-       ▼
-Log-based metric "uppass-pii-leak" increments (count > 0)
-       │
-       ▼
-Alerting policy fires → email to josukekung@gmail.com
-       │
-       ▼
-On-call engineer investigates within minutes, not hours
+Developer accidentally logs national_id
+            │
+            ▼
+Cloud Run stdout → Cloud Logging ingests entry
+            │
+            ▼
+Log-based metric "uppass-pii-leak" increments
+(filter: textPayload =~ "SECURITY_VIOLATION")
+            │
+            ▼  threshold: count > 0
+Alerting policy "UpPass PII Leak Alert" fires
+            │
+            ▼
+Email → josukekung@gmail.com  (within ~60 seconds)
+            │
+            ▼
+Engineer investigates — breach window: minutes, not 24 hours
 ```
 
-The demo endpoint `/v1/submit-unsafe` simulates this path — it writes `SECURITY_VIOLATION: national_id=…` to stdout, which is visible in the Security Monitor module of the frontend and triggers the live alert.
+Without this alerting: a breach discovered only at the next audit = 24+ hours of exposure.
+With this alerting: notified within 1 minute = minimal exposure window.
 
 ---
 
 #### Control 6 — PR Review Checklist
 
 ```markdown
-## Security Checklist (required for every PR touching decrypt/submit paths)
-- [ ] No PII (National ID, name, phone, email) passed to any log statement
-- [ ] New environment variables documented and stored in Secret Manager
-- [ ] No secrets committed to the repository (TruffleHog will block the build)
-- [ ] Decryption logic reviewed by a second engineer
+## Security Checklist (required for every PR touching submit/decrypt paths)
+- [ ] No PII (national ID, name, phone) passed to any log statement
+- [ ] All new secrets stored in Secret Manager, not env vars or code
+- [ ] No secrets committed (TruffleHog blocks the build if any are found)
+- [ ] Decrypt/submit logic reviewed by a second engineer
 - [ ] Semgrep PII check passing in CI
 ```
 
 ---
 
-### Control Effectiveness Summary
+### Defence-in-Depth Summary
 
 ```
-Attack surface: developer accidentally logs plaintext national_id
+Attack: developer accidentally calls log.warning("...", national_id, ...)
 
-Layer 1 — Prevention (before merge)
-  ├─ Semgrep rule blocks PR if log(national_id) pattern is detected
-  └─ PR checklist requires second-engineer review of decrypt paths
+Layer 1 — Prevention at code review (before merge)
+  ├─ Semgrep blocks PR: log($FUNC, ..., national_id, ...) pattern detected
+  └─ PR checklist: second-engineer review required for all decrypt paths
 
-Layer 2 — Prevention (at runtime)
-  └─ PIIScrubFilter replaces 13-digit strings with [REDACTED] before write
+Layer 2 — Prevention at runtime (even if merged)
+  └─ PIIScrubFilter: replaces \d{13} with [REDACTED] before log write
+     → log entry contains "[REDACTED]" not the real national ID
 
-Layer 3 — Detection (post-deployment)
-  ├─ GCP log-based metric counts SECURITY_VIOLATION entries
-  └─ Alerting policy emails on-call within 60 seconds of first occurrence
+Layer 3 — Detection (even if scrubbing missed it)
+  ├─ Log-based metric counts "SECURITY_VIOLATION" entries
+  └─ Alert fires within ~60 seconds → on-call notified immediately
 
-Layer 4 — Response (if detection fires)
-  ├─ Immediate: redeploy with fix, scope damage via log query
-  ├─ Short-term: purge or expire affected logs
-  └─ Long-term: PDPA/GDPR notification, post-mortem, process improvement
+Layer 4 — Response
+  ├─ Redeploy fix, disable endpoint if needed
+  ├─ Scope damage: gcloud logging read + audit log export
+  └─ PDPA/GDPR notification, individual letters, post-mortem
 
-Without Layer 3:  breach discovered at next audit  → 24+ hours of exposure
-With    Layer 3:  breach discovered within 1 minute → minimal exposure window
+Without Layer 3:  24+ hours silent exposure
+With    Layer 3:  ~1 minute to detection
 ```
 
 ---
 
 ### Post-Incident Review (1 Week After Containment)
 
-Hold a **blameless post-mortem**. The goal is systemic improvement, not individual blame.
+Hold a **blameless post-mortem**. Systemic improvement, not individual blame.
 
 | Section | Content |
 |---------|---------|
-| **Timeline** | Exact sequence from code commit to discovery to containment |
-| **Root cause** | Log statement added during debugging, not caught in review |
-| **Contributing factors** | No scrubbing middleware, no lint rule, no real-time alerting |
-| **Impact** | N unique national IDs exposed, T hours of exposure |
-| **What went well** | Audit process caught it; fast containment once discovered |
-| **Action items** | Middleware (Platform, 3 days), Semgrep (Security, 1 week), PR checklist (Tech Lead, 1 day), alerting (already done) |
+| **Timeline** | Code commit → deployment → first log entry → alert → containment |
+| **Root cause** | Debug log statement left in production code, not caught in review |
+| **Contributing factors** | No scrubbing middleware, no lint rule, alert not configured at time of incident |
+| **Impact** | N unique national IDs, T hours of exposure, Y log sinks reached |
+| **What went well** | Fast containment once alert fired; legal hold preserved before purge |
+| **Action items** | PIIScrubFilter (Platform, 3 days) · Semgrep rule (Security, 1 week) · PR checklist update (Tech Lead, 1 day) · GCP alerting (already done) |
 
-Document and circulate to all engineers. Review action item completion at the next sprint.
+Circulate to all engineers. Review action items at next sprint retro.
 
 ---
 

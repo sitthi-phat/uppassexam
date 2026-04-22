@@ -175,9 +175,10 @@ This enables zero-downtime key rotation — old and new records coexist and are 
 ### Security Controls
 
 - **No PII in logs:** `national_id` is never passed to any `log.*` call in normal operation
-- **HMAC versioning:** chunked migration; search tries all known versions during rotation window
-- **Single worker per instance:** `--workers 1` ensures in-memory key state is consistent; `--max-instances=1` prevents key-state divergence across instances
-- **Keys from Secret Manager:** private key, DEK, and HMAC secret are fetched from GCP Secret Manager at startup — never baked into the image
+- **All key versions loaded at startup:** `init_dek/hmac/rsa` query the DB for every distinct version label, then fetch each from Secret Manager by version number — so restarts after rotation always load the correct keys
+- **HMAC versioning:** `state.hmac_secrets` is a dict (same as `dek_keys`); search tries every loaded version so records remain findable during chunked migration
+- **`--max-instances=1`:** recommended to prevent hot-rotation state divergence across instances; correctness across restarts is fully solved by SM loading
+- **Keys from Secret Manager:** all key versions fetched from SM at startup — never from env var after v1, never baked into the image
 - **Non-root Docker user:** container runs as `uppass`, not `root`
 - **TruffleHog in CI:** Cloud Build scans for hardcoded secrets before building Docker images
 
@@ -301,15 +302,33 @@ Response: { new_version, recomputed_records, remaining_records, message }
 
 The demo frontend loops automatically until all records are migrated.
 
-### How the System Knows Which Key to Use
+### How the System Knows Which Key to Use — Including After Restarts
 
-Every record stores plain (non-encrypted) version columns. The read path is:
+Every record stores plain (non-encrypted) version columns. The version label maps directly to a Secret Manager version number (`"vN"` → SM version `N`).
+
+**At startup**, all three init functions load every version referenced in the DB:
+
+```python
+# pseudocode — actual impl in backend/app/main.py
+def init_dek():
+    versions = db.distinct("dek_version")   # e.g. {"v1", "v2"}
+    for ver in versions:
+        raw = secret_manager.get("uppass-dek", version=int(ver[1:]))  # SM version 1, 2, …
+        state.dek_keys[ver] = sha256(raw)
+    state.current_dek_version = max(versions)
+```
+
+**At read time**, the correct key is always available regardless of when the server started:
 
 ```python
 def decrypt_record(record):
-    dek = state.dek_keys[record.dek_version]        # in-memory dict lookup
+    dek = state.dek_keys[record.dek_version]   # always present after startup
     return aes_gcm_decrypt(record.encrypted_data, dek)
 ```
+
+**Before this fix:** `init_dek` loaded one key from the env var and guessed the version label from the DB — so a restart after rotation loaded the old key under the new label, causing decryption failures.
+
+**After this fix:** every version is loaded from its exact SM version number, so restarts are safe regardless of how many rotations have occurred.
 
 ---
 
