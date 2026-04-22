@@ -10,7 +10,7 @@ import hashlib
 import logging
 import secrets
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..state import state
@@ -98,25 +98,22 @@ def rotate_rsa():
         serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode()
 
-    secret_stored = False
     try:
         store_secret_version("uppass-private-key-v1-b64", base64.b64encode(pem_bytes))
-        secret_stored = True
         log.info("Stored new RSA key to Secret Manager (version=%s)", new_ver)
     except Exception as exc:
-        log.warning("Secret Manager store skipped (%s) — demo mode", type(exc).__name__)
+        log.error("RSA rotation aborted — Secret Manager write failed: %s", exc)
+        raise HTTPException(status_code=503,
+            detail=f"Secret Manager write failed — rotation aborted so state stays consistent across restarts. {type(exc).__name__}: {exc}")
 
     state.private_keys[new_ver] = new_private_key
     state.current_rsa_version   = new_ver
-    log.info("RSA rotated to version=%s (secret_stored=%s)", new_ver, secret_stored)
+    log.info("RSA rotated to version=%s", new_ver)
 
     return RotateRSAResponse(
         new_version=new_ver,
         public_key=pub_pem,
-        message=(
-            f"RSA key rotated to {new_ver}. New public key active. Old keys kept for decryption."
-            + ("" if secret_stored else " [Demo: Secret Manager not updated]")
-        ),
+        message=f"RSA key rotated to {new_ver}. New public key active. Old keys kept for decryption.",
     )
 
 
@@ -141,17 +138,17 @@ def rotate_dek(body: RotateDEKRequest = RotateDEKRequest(), db: Session = Depend
         new_raw_hex = secrets.token_hex(32)
         new_dek     = hashlib.sha256(new_raw_hex.encode()).digest()
 
-        secret_stored = False
         try:
             store_secret_version("uppass-dek", new_raw_hex.encode())
-            secret_stored = True
             log.info("Stored new DEK to Secret Manager")
         except Exception as exc:
-            log.warning("Secret Manager store skipped (%s) — demo mode", type(exc).__name__)
+            log.error("DEK rotation aborted — Secret Manager write failed: %s", exc)
+            raise HTTPException(status_code=503,
+                detail=f"Secret Manager write failed — rotation aborted so state stays consistent across restarts. {type(exc).__name__}: {exc}")
 
         state.dek_keys[new_ver]   = new_dek
         state.current_dek_version = new_ver
-        log.info("DEK rotated to version=%s (secret_stored=%s)", new_ver, secret_stored)
+        log.info("DEK rotated to version=%s", new_ver)
     else:
         new_ver = state.current_dek_version
         log.info("Continuing DEK migration to version=%s, %d records pending", new_ver, pending_count)
@@ -215,17 +212,17 @@ def rotate_hmac(body: RotateHMACRequest = RotateHMACRequest(), db: Session = Dep
         new_secret_hex = secrets.token_hex(32)
         new_secret     = new_secret_hex.encode()
 
-        secret_stored = False
         try:
             store_secret_version("uppass-hmac-secret", new_secret)
-            secret_stored = True
             log.info("Stored new HMAC secret to Secret Manager")
         except Exception as exc:
-            log.warning("Secret Manager store skipped (%s) — demo mode", type(exc).__name__)
+            log.error("HMAC rotation aborted — Secret Manager write failed: %s", exc)
+            raise HTTPException(status_code=503,
+                detail=f"Secret Manager write failed — rotation aborted so state stays consistent across restarts. {type(exc).__name__}: {exc}")
 
         state.hmac_secrets[new_ver] = new_secret
         state.current_hmac_version  = new_ver
-        log.info("HMAC rotated to version=%s (secret_stored=%s)", new_ver, secret_stored)
+        log.info("HMAC rotated to version=%s", new_ver)
     else:
         new_ver = state.current_hmac_version
         log.info("Continuing HMAC migration to version=%s, %d records pending", new_ver, pending_count)

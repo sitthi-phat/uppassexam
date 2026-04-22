@@ -72,9 +72,25 @@
     .alert-badge.active { background: #5c2121; color: #f85149; }
     .alert-badge.clear  { background: #1f6130; color: #3fb950; }
     .violations-empty { color: #8b949e; font-size: 13px; padding: 16px; text-align: center; }
+    #coldStartOverlay { position: fixed; inset: 0; background: #0d1117; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 999; gap: 20px; }
+    #coldStartOverlay.hidden { display: none; }
+    .spinner { width: 40px; height: 40px; border: 3px solid #30363d; border-top-color: #58a6ff; border-radius: 50%; animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .cold-title { color: #58a6ff; font-size: 18px; font-weight: bold; }
+    .cold-sub { color: #8b949e; font-size: 13px; text-align: center; max-width: 320px; line-height: 1.6; }
+    .cold-attempts { color: #e3b341; font-size: 12px; margin-top: 4px; }
   </style>
 </head>
 <body>
+
+<!-- Cold-start waiting overlay — hidden once /health responds -->
+<div id="coldStartOverlay">
+  <div class="spinner"></div>
+  <div class="cold-title">Starting Service</div>
+  <div class="cold-sub">Cloud Run is waking up from scale-to-zero.<br>This takes 10–20 seconds on a cold start.</div>
+  <div class="cold-attempts" id="coldAttempts">Connecting…</div>
+</div>
+
 <div class="page-layout">
 <div class="main-content">
   <h1>UpPass Secure Bridge</h1>
@@ -288,7 +304,27 @@
       }
     }
 
+    // ── Cold-start: poll /health until alive, then reveal UI ───────────────
+    async function waitForBackend() {
+      const overlay  = document.getElementById("coldStartOverlay");
+      const attempts = document.getElementById("coldAttempts");
+      let count = 0;
+      while (true) {
+        count++;
+        attempts.textContent = `Attempt ${count}…`;
+        try {
+          const res = await fetch(`${API}/health`, { signal: AbortSignal.timeout(4000) });
+          if (res.ok) {
+            overlay.classList.add("hidden");
+            return;
+          }
+        } catch (_) { /* not yet alive */ }
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+
     // Initialise
+    await waitForBackend();
     await initBridge();
     await refreshStatus();
 
