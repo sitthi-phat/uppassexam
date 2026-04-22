@@ -402,6 +402,7 @@ class AdminStatusResponse(BaseModel):
     dek_version:   str
     hmac_version:  str
     total_records: int
+    dek_pending:   int   # records not yet on current DEK version
     hmac_pending:  int   # records not yet on current HMAC version
 
 
@@ -411,10 +412,15 @@ class RotateRSAResponse(BaseModel):
     message:     str
 
 
+class RotateDEKRequest(BaseModel):
+    chunk_size: int = Field(default=1000, ge=1, le=50000, description="Records to re-encrypt per call")
+
+
 class RotateDEKResponse(BaseModel):
-    new_version:      str
-    migrated_records: int
-    message:          str
+    new_version:         str
+    reencrypted_records: int
+    remaining_records:   int
+    message:             str
 
 
 class RotateHMACRequest(BaseModel):
@@ -515,8 +521,13 @@ def search(national_id: str, db: Session = Depends(get_db)):
 
 @app.get("/v1/admin/status", response_model=AdminStatusResponse)
 def admin_status(db: Session = Depends(get_db)):
-    total   = db.query(NationalIdRecord).count()
-    pending = (
+    total        = db.query(NationalIdRecord).count()
+    dek_pending  = (
+        db.query(NationalIdRecord)
+        .filter(NationalIdRecord.dek_version != state.current_dek_version)
+        .count()
+    )
+    hmac_pending = (
         db.query(NationalIdRecord)
         .filter(NationalIdRecord.hmac_version != state.current_hmac_version)
         .count()
@@ -526,7 +537,8 @@ def admin_status(db: Session = Depends(get_db)):
         dek_version=state.current_dek_version,
         hmac_version=state.current_hmac_version,
         total_records=total,
-        hmac_pending=pending,
+        dek_pending=dek_pending,
+        hmac_pending=hmac_pending,
     )
 
 
@@ -581,60 +593,91 @@ def rotate_rsa():
 
 
 @app.post("/v1/admin/rotate-dek", response_model=RotateDEKResponse)
-def rotate_dek(db: Session = Depends(get_db)):
+def rotate_dek(body: RotateDEKRequest = RotateDEKRequest(), db: Session = Depends(get_db)):
     """
-    Generate a new DEK, re-encrypt all existing records, update state.
-    In production you would also re-wrap wrapped keys; here we re-encrypt directly.
-    """
-    existing  = list(state.dek_keys.keys())
-    max_num   = max((int(v[1:]) for v in existing if v.startswith("v") and v[1:].isdigit()), default=1)
-    new_ver   = f"v{max_num + 1}"
-    # Generate random material as hex string — same format as the original secret.
-    # Derive the actual AES key with sha256, matching init_dek() so restarts reload correctly.
-    new_raw_hex = secrets.token_hex(32)
-    new_dek     = hashlib.sha256(new_raw_hex.encode()).digest()
+    Chunked DEK rotation — same pattern as rotate_hmac.
 
-    # Re-encrypt all records
-    records = db.query(NationalIdRecord).all()
-    migrated = 0
+    First call: generates a new DEK, stores to Secret Manager, hot-reloads
+    state.dek_keys, then re-encrypts up to chunk_size records.
+
+    Subsequent calls: continues re-encrypting remaining old-version records.
+    During the migration window, reads work for all versions (old keys remain
+    in state.dek_keys); new writes use the new DEK version.
+    """
+    pending_count = (
+        db.query(NationalIdRecord)
+        .filter(NationalIdRecord.dek_version != state.current_dek_version)
+        .count()
+    )
+
+    if pending_count == 0:
+        # Fresh rotation: bump version, generate new DEK
+        existing = list(state.dek_keys.keys())
+        max_num  = max((int(v[1:]) for v in existing if v.startswith("v") and v[1:].isdigit()), default=1)
+        new_ver     = f"v{max_num + 1}"
+        new_raw_hex = secrets.token_hex(32)
+        new_dek     = hashlib.sha256(new_raw_hex.encode()).digest()
+
+        # Store to Secret Manager (best-effort)
+        secret_stored = False
+        try:
+            _store_secret_version("uppass-dek", new_raw_hex.encode())
+            secret_stored = True
+            log.info("Stored new DEK to Secret Manager")
+        except Exception as exc:
+            log.warning("Secret Manager store skipped (%s) — demo mode", type(exc).__name__)
+
+        # Hot-reload — add to dict, old keys remain for reading existing records
+        state.dek_keys[new_ver]   = new_dek
+        state.current_dek_version = new_ver
+        log.info("DEK rotated to version=%s (secret_stored=%s)", new_ver, secret_stored)
+    else:
+        new_ver = state.current_dek_version
+        log.info("Continuing DEK migration to version=%s, %d records pending", new_ver, pending_count)
+
+    # Re-encrypt one chunk of records still on an old DEK version
+    records = (
+        db.query(NationalIdRecord)
+        .filter(NationalIdRecord.dek_version != new_ver)
+        .limit(body.chunk_size)
+        .all()
+    )
+
+    reencrypted = 0
     for rec in records:
-        # Fall back to v1 for records created before dek_version column existed
-        dek_ver = rec.dek_version or "v1"
-        old_key = state.dek_keys.get(dek_ver)
+        old_dek_ver = rec.dek_version or "v1"
+        old_key     = state.dek_keys.get(old_dek_ver)
         if old_key is None:
-            log.warning("Record %s has unknown dek_version=%s, skipping", rec.id, dek_ver)
+            log.warning("Record %s has unknown dek_version=%s, skipping", rec.id, old_dek_ver)
             continue
         try:
-            plaintext = aes_gcm_decrypt(rec.encrypted_data, rec.storage_iv, old_key)
-            new_ct, new_iv = aes_gcm_encrypt(plaintext, new_dek)
+            plaintext          = aes_gcm_decrypt(rec.encrypted_data, rec.storage_iv, old_key)
+            new_ct, new_iv     = aes_gcm_encrypt(plaintext, state.dek_keys[new_ver])
             rec.encrypted_data = new_ct
             rec.storage_iv     = new_iv
             rec.dek_version    = new_ver
-            migrated += 1
+            reencrypted += 1
         except Exception as exc:
             log.error("Failed to re-encrypt record %s: %s — %s", rec.id, type(exc).__name__, exc)
 
     db.commit()
 
-    # Store to Secret Manager (best-effort)
-    secret_stored = False
-    try:
-        _store_secret_version("uppass-dek", new_raw_hex.encode())
-        secret_stored = True
-        log.info("Stored new DEK to Secret Manager")
-    except Exception as exc:
-        log.warning("Secret Manager store skipped (%s) — running in demo mode", type(exc).__name__)
-
-    # Hot-reload
-    state.dek_keys[new_ver]      = new_dek
-    state.current_dek_version    = new_ver
-    log.info("DEK rotated to version=%s, migrated %d records (secret_stored=%s)", new_ver, migrated, secret_stored)
+    remaining = (
+        db.query(NationalIdRecord)
+        .filter(NationalIdRecord.dek_version != new_ver)
+        .count()
+    )
+    log.info("DEK chunk done: reencrypted=%d remaining=%d", reencrypted, remaining)
 
     return RotateDEKResponse(
         new_version=new_ver,
-        migrated_records=migrated,
-        message=f"DEK rotated to {new_ver}. {migrated} record(s) re-encrypted."
-        + ("" if secret_stored else " [Demo mode: Secret Manager not updated]"),
+        reencrypted_records=reencrypted,
+        remaining_records=remaining,
+        message=(
+            f"DEK migrated to {new_ver}: {reencrypted} re-encrypted, {remaining} remaining."
+            if remaining > 0
+            else f"DEK migration to {new_ver} complete. All records updated."
+        ),
     )
 
 

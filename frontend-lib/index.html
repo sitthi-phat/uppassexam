@@ -97,7 +97,10 @@
     <div class="status-bar" id="statusBar">
       <div class="status-item"><span class="status-label">RSA Version</span><span class="status-value" id="statusRSA">—</span></div>
       <div class="status-item"><span class="status-label">DEK Version</span><span class="status-value" id="statusDEK">—</span></div>
+      <div class="status-item"><span class="status-label">HMAC Version</span><span class="status-value" id="statusHMAC">—</span></div>
       <div class="status-item"><span class="status-label">Total Records</span><span class="status-value" id="statusRecords">—</span></div>
+      <div class="status-item"><span class="status-label">DEK Pending</span><span class="status-value" id="statusDEKPending">—</span></div>
+      <div class="status-item"><span class="status-label">HMAC Pending</span><span class="status-value" id="statusHMACPending">—</span></div>
     </div>
 
     <div class="admin-grid">
@@ -119,8 +122,12 @@
         <div class="card-title dek">DEK Rotation</div>
         <div class="card-desc">
           Use when: compliance policy requires periodic re-encryption.<br>
-          Generates 256-bit DEK, re-encrypts all stored records with new key.
+          Generates 256-bit DEK, re-encrypts records in chunks. Old keys remain
+          active for unprocessed records during the migration window.
         </div>
+        <label style="color:#8b949e;font-size:12px;margin-top:8px">Chunk size (records per call)</label>
+        <input id="dekChunkSize" type="number" value="100" min="1" max="50000"
+               style="width:120px;margin-top:4px" />
         <button class="warn" onclick="rotateDEK()" id="btnDEK">Generate &amp; Rotate DEK</button>
         <pre id="dekOut">—</pre>
       </div>
@@ -211,9 +218,12 @@
     async function refreshStatus() {
       try {
         const s = await fetch(`${API}/v1/admin/status`).then(r => r.json());
-        document.getElementById("statusRSA").textContent     = s.rsa_version;
-        document.getElementById("statusDEK").textContent     = s.dek_version;
-        document.getElementById("statusRecords").textContent = s.total_records;
+        document.getElementById("statusRSA").textContent        = s.rsa_version;
+        document.getElementById("statusDEK").textContent        = s.dek_version;
+        document.getElementById("statusHMAC").textContent       = s.hmac_version;
+        document.getElementById("statusRecords").textContent    = s.total_records;
+        document.getElementById("statusDEKPending").textContent = s.dek_pending ?? 0;
+        document.getElementById("statusHMACPending").textContent = s.hmac_pending ?? 0;
       } catch (e) {
         // status bar update is non-critical
       }
@@ -292,17 +302,43 @@
       }
     };
 
-    // ── Rotate DEK ──────────────────────────────────────────────────────────
+    // ── Rotate DEK (chunked) ────────────────────────────────────────────────
     window.rotateDEK = async function () {
-      const out = document.getElementById("dekOut");
-      const btn = document.getElementById("btnDEK");
+      const out       = document.getElementById("dekOut");
+      const btn       = document.getElementById("btnDEK");
+      const chunkSize = parseInt(document.getElementById("dekChunkSize").value) || 100;
       btn.disabled = true;
-      out.textContent = "Generating new DEK and re-encrypting all records…";
+
+      let totalReencrypted = 0;
+      let newVersion       = null;
+      let callCount        = 0;
+
       try {
-        const res  = await fetch(`${API}/v1/admin/rotate-dek`, { method: "POST" });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Rotation failed");
-        out.innerHTML = '<span class="tag ok">Rotated</span>\n' + JSON.stringify(data, null, 2);
+        while (true) {
+          callCount++;
+          out.textContent = `Migrating… (call #${callCount}, re-encrypted so far: ${totalReencrypted})`;
+
+          const res  = await fetch(`${API}/v1/admin/rotate-dek`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chunk_size: chunkSize }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Rotation failed");
+
+          newVersion        = data.new_version;
+          totalReencrypted += data.reencrypted_records;
+
+          if (data.remaining_records === 0) {
+            out.innerHTML = '<span class="tag ok">Complete</span>\n' + JSON.stringify({
+              new_version:       newVersion,
+              total_reencrypted: totalReencrypted,
+              calls_needed:      callCount,
+              message:           data.message,
+            }, null, 2);
+            break;
+          }
+        }
         await refreshStatus();
       } catch (e) {
         out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
