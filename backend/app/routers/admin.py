@@ -15,8 +15,8 @@ from sqlalchemy.orm import Session
 
 from ..state import state
 from ..database import NationalIdRecord, get_db
-from ..crypto import aes_gcm_decrypt, aes_gcm_encrypt, compute_blind_index, get_storage_key
-from ..gcp import store_secret_version
+from ..crypto import aes_gcm_decrypt, aes_gcm_encrypt, compute_blind_index
+from ..gcp import create_versioned_secret
 from ..schemas import (
     AdminStatusResponse,
     RotateRSAResponse,
@@ -99,7 +99,7 @@ def rotate_rsa():
     ).decode()
 
     try:
-        store_secret_version("uppass-private-key-v1-b64", base64.b64encode(pem_bytes))
+        create_versioned_secret("uppass-private-key-v1-b64", new_ver, base64.b64encode(pem_bytes))
         log.info("Stored new RSA key to Secret Manager (version=%s)", new_ver)
     except Exception as exc:
         log.error("RSA rotation aborted — Secret Manager write failed: %s", exc)
@@ -139,7 +139,7 @@ def rotate_dek(body: RotateDEKRequest = RotateDEKRequest(), db: Session = Depend
         new_dek     = hashlib.sha256(new_raw_hex.encode()).digest()
 
         try:
-            store_secret_version("uppass-dek", new_raw_hex.encode())
+            create_versioned_secret("uppass-dek", new_ver, new_raw_hex.encode())
             log.info("Stored new DEK to Secret Manager")
         except Exception as exc:
             log.error("DEK rotation aborted — Secret Manager write failed: %s", exc)
@@ -213,7 +213,7 @@ def rotate_hmac(body: RotateHMACRequest = RotateHMACRequest(), db: Session = Dep
         new_secret     = new_secret_hex.encode()
 
         try:
-            store_secret_version("uppass-hmac-secret", new_secret)
+            create_versioned_secret("uppass-hmac-secret", new_ver, new_secret)
             log.info("Stored new HMAC secret to Secret Manager")
         except Exception as exc:
             log.error("HMAC rotation aborted — Secret Manager write failed: %s", exc)

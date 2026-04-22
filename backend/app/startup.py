@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives import serialization
 
 from .state import state
 from .database import db_distinct_versions
-from .gcp import load_secret_version
+from .gcp import load_versioned_secret
 
 log = logging.getLogger("uppass")
 
@@ -18,16 +18,15 @@ _PRIVATE_KEY_PATH = os.environ.get("PRIVATE_KEY_PATH", "keys/private.pem")
 
 def load_private_keys() -> None:
     """
-    Load ALL RSA private key versions referenced in the DB from Secret Manager.
-    DB label "vN" maps to SM version number N on secret 'uppass-private-key-v1-b64'.
-    Falls back to PRIVATE_KEY_B64 env var or key files for v1 (local dev).
+    Load ALL RSA private key versions referenced in the DB.
+    v1  → reads uppass-private-key-v1-b64 SM version 1 (env var fallback for local dev)
+    v2+ → reads named secret uppass-private-key-v1-b64-v2, uppass-private-key-v1-b64-v3, …
     """
     versions = db_distinct_versions("key_version") | {"v1"}
 
     for ver in sorted(versions, key=lambda v: int(v[1:])):
-        ver_num = int(ver[1:])
         try:
-            raw_b64 = load_secret_version("uppass-private-key-v1-b64", ver_num)
+            raw_b64 = load_versioned_secret("uppass-private-key-v1-b64", ver)
             pem = base64.b64decode(raw_b64)
             state.private_keys[ver] = serialization.load_pem_private_key(pem, password=None)
             log.info("Loaded RSA key version=%s from Secret Manager", ver)
@@ -65,16 +64,15 @@ def load_private_keys() -> None:
 
 def init_dek() -> None:
     """
-    Load ALL DEK versions referenced in the DB from Secret Manager.
-    DB label "vN" maps to SM version number N on secret 'uppass-dek'.
-    Falls back to DATA_ENCRYPTION_KEY env var for v1 (local dev).
+    Load ALL DEK versions referenced in the DB.
+    v1  → reads uppass-dek SM version 1 (env var fallback for local dev)
+    v2+ → reads named secret uppass-dek-v2, uppass-dek-v3, …
     """
     versions = db_distinct_versions("dek_version") | {"v1"}
 
     for ver in sorted(versions, key=lambda v: int(v[1:])):
-        ver_num = int(ver[1:])
         try:
-            raw = load_secret_version("uppass-dek", ver_num)
+            raw = load_versioned_secret("uppass-dek", ver)
             state.dek_keys[ver] = hashlib.sha256(raw.encode()).digest()
             log.info("Loaded DEK version=%s from Secret Manager", ver)
             continue
@@ -96,16 +94,15 @@ def init_dek() -> None:
 
 def init_hmac() -> None:
     """
-    Load ALL HMAC secret versions referenced in the DB from Secret Manager.
-    DB label "vN" maps to SM version number N on secret 'uppass-hmac-secret'.
-    Falls back to HMAC_SECRET env var for v1 (local dev).
+    Load ALL HMAC secret versions referenced in the DB.
+    v1  → reads uppass-hmac-secret SM version 1 (env var fallback for local dev)
+    v2+ → reads named secret uppass-hmac-secret-v2, uppass-hmac-secret-v3, …
     """
     versions = db_distinct_versions("hmac_version") | {"v1"}
 
     for ver in sorted(versions, key=lambda v: int(v[1:])):
-        ver_num = int(ver[1:])
         try:
-            raw = load_secret_version("uppass-hmac-secret", ver_num)
+            raw = load_versioned_secret("uppass-hmac-secret", ver)
             state.hmac_secrets[ver] = raw.encode()
             log.info("Loaded HMAC secret version=%s from Secret Manager", ver)
             continue
