@@ -4,7 +4,22 @@
   <meta charset="UTF-8" />
   <title>UpPass Secure Bridge — Demo</title>
   <style>
-    body { font-family: monospace; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #0d1117; color: #c9d1d9; }
+    body { font-family: monospace; margin: 0; padding: 0; background: #0d1117; color: #c9d1d9; }
+    .page-layout { display: flex; align-items: flex-start; gap: 24px; max-width: 1280px; margin: 40px auto; padding: 0 20px; }
+    .main-content { flex: 1; min-width: 0; }
+    .records-panel { width: 480px; flex-shrink: 0; position: sticky; top: 24px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; max-height: calc(100vh - 48px); display: flex; flex-direction: column; }
+    .records-panel-title { font-size: 14px; font-weight: bold; color: #e6edf3; margin-bottom: 4px; }
+    .records-panel-sub { font-size: 11px; color: #8b949e; margin-bottom: 12px; }
+    .records-panel-controls { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+    .records-panel-controls button { margin-top: 0; padding: 6px 14px; font-size: 12px; }
+    .records-count { font-size: 11px; color: #8b949e; margin-bottom: 8px; }
+    .records-table-wrap { overflow-y: auto; flex: 1; }
+    .records-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .records-table th { color: #8b949e; text-align: left; padding: 4px 6px; border-bottom: 1px solid #30363d; white-space: nowrap; }
+    .records-table td { padding: 4px 6px; border-bottom: 1px solid #21262d; vertical-align: top; word-break: break-all; }
+    .records-table tr:last-child td { border-bottom: none; }
+    .records-table .ver { color: #3fb950; }
+    .records-empty { color: #8b949e; font-size: 12px; padding: 16px; text-align: center; }
     h1 { color: #58a6ff; }
     h2 { color: #e6edf3; margin-bottom: 8px; }
     h3 { color: #8b949e; font-size: 13px; margin: 0 0 12px 0; font-weight: normal; }
@@ -60,6 +75,8 @@
   </style>
 </head>
 <body>
+<div class="page-layout">
+<div class="main-content">
   <h1>UpPass Secure Bridge</h1>
   <p>End-to-end encryption demo — hybrid RSA-OAEP + AES-256-GCM</p>
   <hr />
@@ -209,6 +226,40 @@
     </div>
   </section>
 
+</div><!-- /.main-content -->
+
+<!-- ── Records Panel ── -->
+<div class="records-panel" id="recordsPanel">
+  <div class="records-panel-title">national_ids Table</div>
+  <div class="records-panel-sub">Record metadata only — no decrypted data exposed</div>
+  <div class="records-panel-controls">
+    <button onclick="refreshRecords()" id="btnRefreshRecords">Refresh</button>
+    <button class="danger" onclick="deleteAllRecords()" id="btnDeleteAll">Delete All</button>
+  </div>
+  <div class="records-count" id="recordsCount">—</div>
+  <div class="records-table-wrap">
+    <table class="records-table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>encrypted_data</th>
+          <th>storage_iv</th>
+          <th>search_index</th>
+          <th>RSA ver</th>
+          <th>DEK ver</th>
+          <th>HMAC ver</th>
+          <th>created_at</th>
+        </tr>
+      </thead>
+      <tbody id="recordsBody">
+        <tr><td colspan="8" class="records-empty">Click Refresh to load</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+</div><!-- /.page-layout -->
+
   <script src="/config.js"></script>
   <script type="module">
     import { UpPassSecureBridge } from "./dist/uppass-secure-bridge.js";
@@ -261,6 +312,7 @@
         out.innerHTML = tag + "\n" + JSON.stringify(data, null, 2);
         document.getElementById("searchId").value = nationalId;
         await refreshStatus();
+        await refreshRecords();
       } catch (e) {
         out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
       } finally {
@@ -377,6 +429,7 @@
         const data = await res.json();
         out.innerHTML = '<span class="tag err">PII Leaked to Logs</span>\n' + JSON.stringify(data, null, 2);
         updateAlertBadge(true);
+        await refreshRecords();
         setTimeout(refreshViolations, 3000);  // give Cloud Logging ~3s to ingest
       } catch (e) {
         out.innerHTML = '<span class="tag err">Error</span>\n' + e.message;
@@ -491,6 +544,59 @@
         btn.disabled = false;
       }
     };
+
+    // ── Records Panel ───────────────────────────────────────────────────────
+    window.refreshRecords = async function () {
+      const tbody = document.getElementById("recordsBody");
+      const count = document.getElementById("recordsCount");
+      const btn   = document.getElementById("btnRefreshRecords");
+      btn.disabled = true;
+      try {
+        const res  = await fetch(`${API}/v1/admin/records`);
+        const data = await res.json();
+        count.textContent = `${data.total} record${data.total !== 1 ? "s" : ""}`;
+        if (!data.records || data.records.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="8" class="records-empty">No records</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.records.map(r => {
+          const ts = r.created_at ? r.created_at.replace("T", " ").slice(0, 19) : "—";
+          return `<tr>
+            <td style="color:#79c0ff;font-size:10px;min-width:120px;word-break:break-all">${escapeHtml(r.id)}</td>
+            <td style="color:#8b949e;font-size:10px">${escapeHtml(r.encrypted_data || "—")}</td>
+            <td style="color:#8b949e;font-size:10px">${escapeHtml(r.storage_iv || "—")}</td>
+            <td style="color:#8b949e;font-size:10px">${escapeHtml(r.search_index || "—")}</td>
+            <td class="ver">${escapeHtml(r.key_version)}</td>
+            <td class="ver">${escapeHtml(r.dek_version)}</td>
+            <td class="ver">${escapeHtml(r.hmac_version)}</td>
+            <td style="color:#8b949e;white-space:nowrap;font-size:10px">${escapeHtml(ts)}</td>
+          </tr>`;
+        }).join("");
+      } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="8" class="records-empty" style="color:#f85149">Error: ${e.message}</td></tr>`;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    window.deleteAllRecords = async function () {
+      if (!confirm("Delete ALL records? Key versions will not be reset.")) return;
+      const btn = document.getElementById("btnDeleteAll");
+      btn.disabled = true;
+      try {
+        const res  = await fetch(`${API}/v1/admin/records/delete-all`, { method: "POST" });
+        const data = await res.json();
+        await refreshRecords();
+        await refreshStatus();
+      } catch (e) {
+        alert("Delete failed: " + e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    // Initial records load
+    refreshRecords();
   </script>
 </body>
 </html>

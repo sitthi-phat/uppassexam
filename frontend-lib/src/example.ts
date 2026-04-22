@@ -10,8 +10,7 @@ import { UpPassSecureBridge } from "./uppass-secure-bridge";
 
 // ── In production: load from environment variable or config endpoint ─────────
 const PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2a2rwplBQLF29amygykE
-... (your RSA-2048 or RSA-4096 public key here) ...
+<REPLACE_WITH_YOUR_PUBLIC_KEY>
 -----END PUBLIC KEY-----`;
 
 async function submitNationalId(nationalId: string): Promise<void> {

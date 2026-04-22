@@ -25,19 +25,25 @@ uppass/
 │   ├── src/
 │   │   ├── uppass-secure-bridge.ts   ← Core encryption library
 │   │   └── example.ts                ← Integration example
-│   ├── index.html                    ← Demo UI (submit, search, key rotation, security monitor)
+│   ├── index.html                    ← Demo UI (submit, search, key rotation, security monitor, records table)
 │   ├── package.json
 │   └── tsconfig.json
 ├── backend/
 │   ├── app/
-│   │   └── main.py                   ← FastAPI service (all endpoints)
+│   │   ├── main.py                   ← FastAPI app + core API (public-key, submit, search)
+│   │   ├── state.py                  ← Hot-reloadable key state singleton
+│   │   ├── database.py               ← DB engine, ORM model, session, helpers
+│   │   ├── crypto.py                 ← RSA unwrap, AES-GCM encrypt/decrypt, HMAC blind index
+│   │   ├── gcp.py                    ← Secret Manager read/write helpers
+│   │   ├── startup.py                ← Key init functions (load_private_keys, init_dek, init_hmac)
+│   │   ├── schemas.py                ← Pydantic request/response models
+│   │   └── routers/
+│   │       ├── admin.py              ← /v1/admin/* endpoints (status, records, rotation, reset)
+│   │       └── monitor.py            ← /v1/submit-unsafe, /v1/admin/monitor/violations
 │   ├── scripts/
 │   │   └── generate_keys.py          ← RSA key-pair generator (local dev only)
 │   ├── requirements.txt
 │   └── Dockerfile
-├── deploy/
-│   ├── deploy.sh                     ← Cloud Run deploy helper
-│   └── setup-gcp.sh                  ← One-time GCP resource provisioning
 ├── cloudbuild.yaml                   ← Cloud Build pipeline (TruffleHog scan → Docker builds)
 ├── .trufflehog-exclude               ← TruffleHog path exclusions
 ├── .gcloudignore                     ← Files excluded from gcloud builds submit
@@ -147,17 +153,24 @@ During an HMAC key rotation, search queries all known HMAC versions so records r
 ### Endpoint Reference
 
 ```
-POST /v1/submit                   Decrypt E2E payload, store with blind index
-POST /v1/submit-unsafe            Same as submit but intentionally logs national_id (security demo)
-GET  /v1/search?national_id=X     Search by National ID (queries all HMAC versions)
-GET  /v1/public-key               Return current RSA public key + version
-GET  /v1/admin/status             Current key versions, record count, HMAC migration progress
-POST /v1/admin/rotate-rsa         Generate new RSA pair, hot-reload server
-POST /v1/admin/rotate-dek         Generate new DEK, re-encrypt all records
-POST /v1/admin/rotate-hmac        Generate new HMAC secret, chunked blind-index migration
-GET  /v1/admin/monitor/violations Query Cloud Logging for SECURITY_VIOLATION entries
-POST /v1/admin/reset-demo         Delete all records and reset key state to v1 (demo only)
-GET  /health                      Liveness probe
+Core API (main.py)
+  GET  /v1/public-key               Return current RSA public key + version
+  POST /v1/submit                   Decrypt E2E payload, store with blind index
+  GET  /v1/search?national_id=X     Search by National ID (queries all HMAC versions)
+  GET  /health                      Liveness probe
+
+Admin (routers/admin.py)
+  GET  /v1/admin/status             Key versions, record count, DEK/HMAC pending counts
+  GET  /v1/admin/records            All record metadata — no decrypted data
+  POST /v1/admin/records/delete-all Delete all records (key state unchanged)
+  POST /v1/admin/rotate-rsa         Generate new RSA pair, hot-reload server
+  POST /v1/admin/rotate-dek         Chunked DEK rotation — { chunk_size }
+  POST /v1/admin/rotate-hmac        Chunked HMAC rotation — { chunk_size }
+  POST /v1/admin/reset-demo         Delete all records + reset key state to v1 (demo only)
+
+Security monitor (routers/monitor.py)
+  POST /v1/submit-unsafe            Same as submit but intentionally logs national_id (demo)
+  GET  /v1/admin/monitor/violations Query Cloud Logging for SECURITY_VIOLATION entries
 ```
 
 ### Key Versioning
@@ -175,8 +188,9 @@ This enables zero-downtime key rotation — old and new records coexist and are 
 ### Security Controls
 
 - **No PII in logs:** `national_id` is never passed to any `log.*` call in normal operation
-- **All key versions loaded at startup:** `init_dek/hmac/rsa` query the DB for every distinct version label, then fetch each from Secret Manager by version number — so restarts after rotation always load the correct keys
+- **All key versions loaded at startup:** `startup.py` — `init_dek/init_hmac/load_private_keys` query the DB for every distinct version label, then fetch each from Secret Manager by version number — so restarts after rotation always load the correct keys
 - **HMAC versioning:** `state.hmac_secrets` is a dict (same as `dek_keys`); search tries every loaded version so records remain findable during chunked migration
+- **Chunked DEK and HMAC rotation:** both `rotate-dek` and `rotate-hmac` accept `{ chunk_size }` and return `remaining_records` — one chunk per call, manual or auto-loop via the demo UI
 - **`--max-instances=1`:** recommended to prevent hot-rotation state divergence across instances; correctness across restarts is fully solved by SM loading
 - **Keys from Secret Manager:** all key versions fetched from SM at startup — never from env var after v1, never baked into the image
 - **Non-root Docker user:** container runs as `uppass`, not `root`
@@ -272,16 +286,18 @@ POST /v1/admin/rotate-hmac  → new HMAC secret, recomputes blind indexes in chu
    → New submits use new public key; old records still decrypt with old private key
 ```
 
-#### DEK Rotation
+#### DEK Rotation (chunked)
 
 ```
-1. Generate 256-bit DEK (SHA256 of random hex)
-2. Store raw hex to Secret Manager
-3. For every record:
-     plaintext = aes_gcm_decrypt(record.encrypted_data, old_dek)
-     record.encrypted_data = aes_gcm_encrypt(plaintext, new_dek)
-     record.dek_version = new_version
-4. Hot-reload: state.dek_keys[new_version] = new_dek
+POST /v1/admin/rotate-dek  body: { "chunk_size": 1000 }
+
+Response: { new_version, reencrypted_records, remaining_records, message }
+
+First call  → generates new DEK, stores to Secret Manager, hot-reloads, then re-encrypts chunk
+Subsequent  → continues re-encrypting remaining old-version records
+Final call  → remaining_records = 0, migration complete
+
+Old DEK keys remain in state.dek_keys throughout — reads never break during migration.
 ```
 
 #### HMAC Rotation (chunked)
@@ -291,16 +307,14 @@ POST /v1/admin/rotate-hmac  body: { "chunk_size": 1000 }
 
 Response: { new_version, recomputed_records, remaining_records, message }
 
-1. Generate new HMAC secret, store to Secret Manager
-2. Process chunk_size records where hmac_version != new_version:
-     plaintext = aes_gcm_decrypt(record.encrypted_data, DEK)
-     record.search_index = hmac_sha256(plaintext, new_secret)
-     record.hmac_version = new_version
-3. Call repeatedly until remaining_records = 0
-   → Search works across all versions during the migration window
+First call  → generates new HMAC secret, stores to Secret Manager, hot-reloads, then migrates chunk
+Subsequent  → continues migrating remaining old-version records
+Final call  → remaining_records = 0, migration complete
+
+Search tries every loaded HMAC version so records remain findable throughout the migration.
 ```
 
-The demo frontend loops automatically until all records are migrated.
+The demo UI runs one chunk per button click by default. An "Auto-loop" checkbox enables automatic completion.
 
 ### How the System Knows Which Key to Use — Including After Restarts
 
@@ -309,11 +323,11 @@ Every record stores plain (non-encrypted) version columns. The version label map
 **At startup**, all three init functions load every version referenced in the DB:
 
 ```python
-# pseudocode — actual impl in backend/app/main.py
+# pseudocode — actual impl in backend/app/startup.py
 def init_dek():
-    versions = db.distinct("dek_version")   # e.g. {"v1", "v2"}
+    versions = db_distinct_versions("dek_version")   # e.g. {"v1", "v2"}
     for ver in versions:
-        raw = secret_manager.get("uppass-dek", version=int(ver[1:]))  # SM version 1, 2, …
+        raw = load_secret_version("uppass-dek", int(ver[1:]))  # SM version 1, 2, …
         state.dek_keys[ver] = sha256(raw)
     state.current_dek_version = max(versions)
 ```

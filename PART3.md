@@ -96,23 +96,25 @@ This makes restarts deterministic: given the DB label `"vN"`, the system always 
 ### Startup Key Loading (actual implementation)
 
 ```python
-def _db_distinct_versions(column: str) -> set:
+# backend/app/database.py
+def db_distinct_versions(column: str) -> set:
     rows = conn.execute(
         f"SELECT DISTINCT {column} FROM national_ids WHERE {column} IS NOT NULL"
     ).fetchall()
     return {row[0] for row in rows if row[0]}
 
+# backend/app/startup.py
 def init_dek() -> None:
-    versions = _db_distinct_versions("dek_version")
-    versions.add("v1")                                   # always need v1 for empty DB
+    versions = db_distinct_versions("dek_version")
+    versions.add("v1")                                    # always need v1 for empty DB
 
     for ver in sorted(versions, key=lambda v: int(v[1:])):
-        ver_num = int(ver[1:])                           # "v2" → 2
+        ver_num = int(ver[1:])                            # "v2" → 2
         try:
-            raw = _load_secret_version("uppass-dek", ver_num)   # fetch SM version N
+            raw = load_secret_version("uppass-dek", ver_num)   # fetch SM version N
             state.dek_keys[ver] = hashlib.sha256(raw.encode()).digest()
         except Exception:
-            if ver == "v1":                              # local dev fallback only
+            if ver == "v1":                               # local dev fallback only
                 raw = os.environ.get("DATA_ENCRYPTION_KEY", "")
                 if raw:
                     state.dek_keys["v1"] = hashlib.sha256(raw.encode()).digest()
@@ -121,6 +123,7 @@ def init_dek() -> None:
 
 # init_hmac() and load_private_keys() follow the identical pattern
 # using "uppass-hmac-secret" and "uppass-private-key-v1-b64" respectively
+# All three live in backend/app/startup.py, called from main.py lifespan
 ```
 
 **Before this fix:** `init_dek` loaded ONE key from `DATA_ENCRYPTION_KEY` env var (always the original v1 bytes) and labeled it with whatever version was in the DB. After a rotation the env var still held v1's hex, so v1's key was stored under label `"v2"` — every decrypt of a v2 record silently failed after restart.
@@ -151,14 +154,19 @@ def init_dek() -> None:
 └──────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────┐
-│  PHASE 2 — Re-encryption  (runs within the same request)             │
+│  PHASE 2 — Re-encryption  (chunked, same pattern as HMAC rotation)   │
 ├──────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  Current implementation: re-encrypts all records in one pass.        │
-│  For millions of records in production, replace with a background    │
-│  batch job that processes chunks (same pattern as HMAC rotation):    │
+│  POST /v1/admin/rotate-dek  { "chunk_size": 1000 }                  │
 │                                                                      │
-│  for record in db.where(dek_version != new_ver).batch(1000):         │
+│  Response: { new_version, reencrypted_records,                       │
+│              remaining_records, message }                            │
+│                                                                      │
+│  First call  → generates new DEK, hot-reloads, re-encrypts chunk     │
+│  Subsequent  → continues migrating remaining old-version records     │
+│  Final call  → remaining_records = 0, migration complete             │
+│                                                                      │
+│  for record in db.where(dek_version != new_ver).limit(chunk_size):  │
 │      plaintext             = aes_gcm_decrypt(record, old_dek)        │
 │      record.encrypted_data = aes_gcm_encrypt(plaintext, new_dek)     │
 │      record.storage_iv     = new_random_iv        # fresh IV         │
@@ -166,8 +174,10 @@ def init_dek() -> None:
 │      db.save(record)                                                 │
 │                                                                      │
 │  • Reads and writes continue normally throughout                     │
-│  • Idempotent — safe to stop, restart, or parallelize                │
-│  • Each batch is a separate DB transaction                           │
+│  • Idempotent — safe to stop, restart, or call in parallel batches   │
+│  • Each chunk is a separate DB transaction                           │
+│  • Demo UI: one chunk per button click; auto-loop checkbox for       │
+│    hands-free completion                                             │
 └──────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -213,13 +223,16 @@ The `search_index` column uses a separate HMAC secret — independent of the DEK
 ```
 POST /v1/admin/rotate-hmac  { "chunk_size": 1000 }
 
-First call  → generates new secret, stores to SM, begins migration
+First call  → generates new secret, stores to SM, hot-reloads, begins migration
               { new_version: "v2", recomputed_records: 1000, remaining_records: 45230 }
 
 Subsequent  → continues migrating remaining old-version records
               { new_version: "v2", recomputed_records: 1000, remaining_records: 44230 }
 
 Final call  → { new_version: "v2", recomputed_records: 230, remaining_records: 0 }
+
+POST /v1/admin/rotate-dek uses the identical chunked pattern:
+              { new_version: "v2", reencrypted_records: 1000, remaining_records: 44230 }
 ```
 
 **Search during migration** — `state.hmac_secrets` is a dict loaded from SM at startup, same pattern as `dek_keys`. Search tries every version so no record becomes unfindable:
