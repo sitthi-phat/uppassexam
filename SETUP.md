@@ -192,7 +192,7 @@ gcloud run deploy uppass-api \
   --memory=512Mi \
   --cpu=1 \
   --min-instances=0 \
-  --max-instances=1 \
+  --max-instances=5 \
   --add-cloudsql-instances="$SQL_CONN" \
   --set-env-vars="ENV=production" \
   --set-env-vars="ENABLE_DOCS=true" \
@@ -203,7 +203,7 @@ gcloud run deploy uppass-api \
   --set-secrets="PRIVATE_KEY_B64=uppass-private-key-v1-b64:1"
 ```
 
-> **`--max-instances=1`**: The backend holds RSA/DEK/HMAC keys in process memory. Multiple instances would each have independent key state, causing decryption failures on requests routed to a different instance. Keep at 1 until the architecture moves keys to an external store (e.g., Cloud KMS).
+> **`--max-instances=5`**: Key getters use a fetch-and-cache pattern — on a cache miss the instance loads the missing version from Secret Manager, caches it locally, and continues. Each instance is independently consistent; no cross-instance signalling is needed. Rotation writes to SM; any instance that hasn't seen the new version yet fetches it on the next request that needs it.
 
 Note the backend URL, e.g.:
 ```
@@ -378,7 +378,7 @@ The frontend HMAC card loops automatically until migration is complete.
 | `DATABASE_URL` truncated at `#` | `#` is URL fragment separator | URL-encode password: replace `#` with `%23` |
 | `/docs` → 404 | `ENABLE_DOCS` not set | `--update-env-vars="ENABLE_DOCS=true"` |
 | `Permission denied on secret` | SA not granted Secret Accessor role | Re-run Step 6 |
-| `rotate_hmac` returns `recomputed_records: 0` | Multiple workers with divergent in-memory state | Ensure `--max-instances=1` and `--workers 1` in Dockerfile CMD |
+| `rotate_hmac` returns `recomputed_records: 0` | HMAC version mismatch between SM and DB | Check SM has the expected `uppass-hmac-secret-vN` named secrets |
 | `/v1/admin/monitor/violations` returns empty or error | SA missing `roles/logging.viewer` | Re-run Step 6 logging.viewer grant |
 | TruffleHog blocks Cloud Build | Hardcoded secret detected in source | Remove secret, store in Secret Manager, re-submit |
 
